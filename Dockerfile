@@ -1,8 +1,10 @@
 FROM node:18
 
-# Install Python and yt-dlp
+# Install Python and pip
 RUN apt-get update && apt-get install -y python3 python3-pip
-RUN pip3 install yt-dlp
+
+# Install yt-dlp globally (bypass external‑managed protection)
+RUN pip3 install yt-dlp --break-system-packages
 
 WORKDIR /usr/src/app
 COPY package*.json ./
