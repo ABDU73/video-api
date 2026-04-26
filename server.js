@@ -1,11 +1,10 @@
 const express = require('express');
 const { exec } = require('child_process');
-const axios = require('axios');                           // ← added
+const axios = require('axios');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ------------------- YouTube API key (set on Render env) -------------------
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;     // ← required
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
 // ------------------- User‑agents and cache (unchanged) -------------------
 const userAgents = [
@@ -36,7 +35,30 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ------------------- Health check (unchanged) -------------------
+// ------------------- Duration helper -------------------
+async function getVideoDurations(videoIds) {
+  if (!videoIds.length) return {};
+  const ids = videoIds.join(',');
+  try {
+    const response = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+      params: {
+        part: 'contentDetails',
+        id: ids,
+        key: YOUTUBE_API_KEY,
+      },
+    });
+    const durationMap = {};
+    response.data.items.forEach(item => {
+      durationMap[item.id] = item.contentDetails.duration;   // ISO 8601, e.g. PT4M13S
+    });
+    return durationMap;
+  } catch (err) {
+    console.error('Failed to fetch video durations:', err.message);
+    return {};
+  }
+}
+
+// ------------------- Health check -------------------
 app.get('/status', (req, res) => {
   res.send({ status: 'ok', cacheSize: cache.size });
 });
@@ -44,14 +66,10 @@ app.get('/status', (req, res) => {
 // ------------------- Main extraction endpoint (unchanged) -------------------
 app.get('/get', async (req, res) => {
   const url = req.query.url;
-  if (!url) {
-    return res.status(400).send({ error: 'Missing url parameter' });
-  }
+  if (!url) return res.status(400).send({ error: 'Missing url parameter' });
 
   const cached = getFromCache(url);
-  if (cached) {
-    return res.send({ url: cached });
-  }
+  if (cached) return res.send({ url: cached });
 
   const clients = ['android', 'ios', 'web', 'mweb'];
   let lastError = null;
@@ -91,39 +109,42 @@ app.get('/get', async (req, res) => {
 });
 
 // ===================================================================
-//                     NEW: Search endpoint (paginated)
+//                     Search endpoint with durations
 // ===================================================================
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
-
-  if (!q) {
-    return res.status(400).json({ error: 'Missing query parameter q' });
-  }
+  if (!q) return res.status(400).json({ error: 'Missing query parameter q' });
 
   try {
     const response = await axios.get('https://www.googleapis.com/youtube/v3/search', {
       params: {
         part: 'snippet',
-        maxResults: 20,                     // 20 per page
+        maxResults: 20,
         q,
         type: 'video',
         key: YOUTUBE_API_KEY,
-        pageToken: pageToken || undefined,   // null → not sent
+        pageToken: pageToken || undefined,
       },
     });
 
-    const items = response.data.items.map(item => ({
+    const items = response.data.items;
+    const videoIds = items.map(item => item.id.videoId);
+
+    // Fetch durations for all video IDs in this page
+    const durationMap = await getVideoDurations(videoIds);
+
+    const videos = items.map(item => ({
       videoId: item.id.videoId,
       title: item.snippet.title,
       author: item.snippet.channelTitle,
       thumbnail: item.snippet.thumbnails.high?.url ||
                  item.snippet.thumbnails.medium?.url ||
                  item.snippet.thumbnails.default?.url,
-      duration: 'Unknown',                 // duration isn't in search results
+      duration: durationMap[item.id.videoId] || 'Unknown',
     }));
 
     res.json({
-      videos: items,
+      videos,
       nextPageToken: response.data.nextPageToken || null,
     });
   } catch (error) {
