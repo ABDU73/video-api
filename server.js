@@ -6,7 +6,6 @@ const port = process.env.PORT || 3000;
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-// ------------------- User‑agents (unchanged) -------------------
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -35,7 +34,7 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ------------------- Duration helper (unchanged) -------------------
+// ---------- Duration helper ----------
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   const ids = videoIds.join(',');
@@ -58,13 +57,13 @@ async function getVideoDurations(videoIds) {
   }
 }
 
-// ------------------- Health check -------------------
+// ---------- Health check ----------
 app.get('/status', (req, res) => {
   res.send({ status: 'ok', cacheSize: cache.size });
 });
 
 // ===================================================================
-//               FAST /get endpoint (android only, no delay)
+//               FAST /get endpoint (android client, no delay)
 // ===================================================================
 app.get('/get', async (req, res) => {
   const url = req.query.url;
@@ -87,13 +86,11 @@ app.get('/get', async (req, res) => {
     const directUrl = result;
     if (directUrl && directUrl.startsWith('http')) {
       setCache(url, directUrl);
-      console.log(`Success for ${url}`);
       return res.send({ url: directUrl });
     }
     throw new Error('No valid URL returned');
   } catch (err) {
-    // If android client fails, try the 'ios' client once without delay
-    console.error(`Android client failed, trying ios client...`);
+    // Quick fallback to ios client without delay
     try {
       const iosUA = getRandomUserAgent();
       const iosCmd = `yt-dlp --user-agent "${iosUA}" --extractor-args youtube:player_client=ios -g "${url}"`;
@@ -106,14 +103,12 @@ app.get('/get', async (req, res) => {
       const directUrl = result;
       if (directUrl && directUrl.startsWith('http')) {
         setCache(url, directUrl);
-        console.log(`Success with ios client for ${url}`);
         return res.send({ url: directUrl });
       }
     } catch (e) {
       console.error('iOS fallback also failed:', e.error?.message || e);
     }
 
-    console.error(`All extraction attempts failed for ${url}`);
     return res.status(500).send({
       error: 'Failed to extract video URL',
       details: err.stderr || 'Unknown error',
@@ -122,7 +117,7 @@ app.get('/get', async (req, res) => {
 });
 
 // ===================================================================
-//                     Search endpoint (unchanged)
+//                     Search endpoint
 // ===================================================================
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
@@ -163,8 +158,6 @@ app.get('/search', async (req, res) => {
     res.status(500).json({ error: 'Search failed' });
   }
 });
-
-// ===================================================================
 
 app.listen(port, () => {
   console.log(`Vortex proxy running on port ${port}`);
