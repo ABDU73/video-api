@@ -17,7 +17,7 @@ const userAgents = [
 // ---------- Cache (unchanged) ----------
 const MAX_CACHE = 100;
 const cache = new Map();
-const CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
+const CACHE_TTL = 10 * 60 * 1000;
 
 function getFromCache(url) {
   const entry = cache.get(url);
@@ -36,13 +36,13 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ---------- Rate limiter (unchanged) ----------
+// ---------- Rate limiter ----------
 const activeRequests = new Set();
 const MAX_CONCURRENT = 3;
 
 async function withRateLimit(url, fn) {
   while (activeRequests.size >= MAX_CONCURRENT) {
-    await new Promise(resolve => setTimeout(resolve, 200));   // shorter wait
+    await new Promise(resolve => setTimeout(resolve, 200));
   }
   try {
     activeRequests.add(url);
@@ -56,7 +56,7 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// ---------- Duration helper ----------
+// ---------- Search helpers ----------
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   const ids = videoIds.join(',');
@@ -104,37 +104,37 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// ==================== ROBUST EXTRACTION ====================
+// ============== FAST EXTRACTION ==============
 async function extract(url) {
   const ua = getRandomUserAgent();
-  const commands = [
-    // 1st: pre‑muxed stream ≤ 720p (fast & safe)
-    `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`,
-    // 2nd: any format (no height limit)
-    `yt-dlp --user-agent "${ua}" -g "${url}"`,
-  ];
-
-  for (const cmd of commands) {
-    console.log(`Trying: ${cmd}`);
-    try {
-      const stdout = await runCommand(cmd);
-      const directUrl = stdout.trim();
-      if (directUrl && directUrl.startsWith('http')) {
-        console.log('Success');
-        return directUrl;
-      }
-    } catch (e) {
-      console.error(`Command failed: ${e.message || e}`);
-    }
+  // First command: fast 720p android format – 12s timeout
+  const cmd1 = `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`;
+  console.log(`Trying (12s): ${cmd1}`);
+  try {
+    const directUrl = await runCommand(cmd1, 12000);
+    if (directUrl && directUrl.startsWith('http')) return directUrl;
+  } catch (e) {
+    console.error('First command failed:', e.message);
   }
+
+  // Second command: any format, no height limit – 12s timeout
+  const cmd2 = `yt-dlp --user-agent "${ua}" -g "${url}"`;
+  console.log(`Trying fallback (12s): ${cmd2}`);
+  try {
+    const directUrl = await runCommand(cmd2, 12000);
+    if (directUrl && directUrl.startsWith('http')) return directUrl;
+  } catch (e) {
+    console.error('Fallback command failed:', e.message);
+  }
+
   throw new Error('All extraction commands failed');
 }
 
-function runCommand(command) {
+function runCommand(command, timeoutMs) {
   return new Promise((resolve, reject) => {
-    exec(command, { timeout: 30000 }, (error, stdout, stderr) => {
+    exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error) reject(error);
-      else resolve(stdout);
+      else resolve(stdout.trim());
     });
   });
 }
