@@ -34,7 +34,7 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ---------- Duration helper ----------
+// ---------- Duration helper (unchanged) ----------
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   const ids = videoIds.join(',');
@@ -63,7 +63,7 @@ app.get('/status', (req, res) => {
 });
 
 // ===================================================================
-//               FAST /get endpoint (android client, no delay)
+//          UPDATED /get endpoint – limits quality to 720p
 // ===================================================================
 app.get('/get', async (req, res) => {
   const url = req.query.url;
@@ -73,8 +73,9 @@ app.get('/get', async (req, res) => {
   if (cached) return res.send({ url: cached });
 
   const userAgent = getRandomUserAgent();
-  const command = `yt-dlp --user-agent "${userAgent}" --extractor-args youtube:player_client=android -g "${url}"`;
-  console.log(`Extracting: ${command}`);
+  // 🔥 Force video height ≤ 720 pixels, best audio
+  const command = `yt-dlp --user-agent "${userAgent}" -f "bestvideo[height<=720]+bestaudio/best[height<=720]" --extractor-args youtube:player_client=android -g "${url}"`;
+  console.log(`Extracting (720p): ${command}`);
 
   try {
     const result = await new Promise((resolve, reject) => {
@@ -90,12 +91,11 @@ app.get('/get', async (req, res) => {
     }
     throw new Error('No valid URL returned');
   } catch (err) {
-    // Quick fallback to ios client without delay
+    // Fallback: try any quality
     try {
-      const iosUA = getRandomUserAgent();
-      const iosCmd = `yt-dlp --user-agent "${iosUA}" --extractor-args youtube:player_client=ios -g "${url}"`;
+      const fallbackCmd = `yt-dlp --user-agent "${getRandomUserAgent()}" -g "${url}"`;
       const result = await new Promise((resolve, reject) => {
-        exec(iosCmd, { timeout: 30000 }, (error, stdout, stderr) => {
+        exec(fallbackCmd, { timeout: 30000 }, (error, stdout, stderr) => {
           if (error) reject({ error, stderr });
           else resolve(stdout.trim());
         });
@@ -103,10 +103,11 @@ app.get('/get', async (req, res) => {
       const directUrl = result;
       if (directUrl && directUrl.startsWith('http')) {
         setCache(url, directUrl);
+        console.log(`Fallback success for ${url}`);
         return res.send({ url: directUrl });
       }
     } catch (e) {
-      console.error('iOS fallback also failed:', e.error?.message || e);
+      console.error('Fallback also failed:', e.error?.message || e);
     }
 
     return res.status(500).send({
@@ -117,7 +118,7 @@ app.get('/get', async (req, res) => {
 });
 
 // ===================================================================
-//                     Search endpoint
+//                     Search endpoint (unchanged)
 // ===================================================================
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
