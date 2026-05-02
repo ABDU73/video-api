@@ -50,7 +50,6 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// Search helpers
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   try {
@@ -63,7 +62,6 @@ async function getVideoDurations(videoIds) {
   } catch (e) { return {}; }
 }
 
-// Endpoints
 app.get('/status', (req, res) => res.send({ status: 'ok', cacheSize: cache.size }));
 
 app.get('/get', async (req, res) => {
@@ -83,17 +81,14 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// Fast extraction: 8s per attempt, only two commands
 async function extract(url) {
   const ua = getRandomUserAgent();
-  // 1st: fast android 720p format
   let cmd = `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`;
   try {
     const out = await runCommand(cmd, 8000);
     if (out && out.startsWith('http')) return out;
   } catch (e) {}
 
-  // 2nd: any format, 8s timeout
   cmd = `yt-dlp --user-agent "${ua}" -g "${url}"`;
   try {
     const out = await runCommand(cmd, 8000);
