@@ -14,7 +14,7 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// ============== Memory‑safe cache (unchanged) ==============
+// ---------- Cache (unchanged) ----------
 const MAX_CACHE = 100;
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
@@ -36,13 +36,13 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ============== Rate limiter (unchanged) ==============
+// ---------- Rate limiter (unchanged) ----------
 const activeRequests = new Set();
-const MAX_CONCURRENT = 3;   // keep safe limit
+const MAX_CONCURRENT = 3;
 
 async function withRateLimit(url, fn) {
   while (activeRequests.size >= MAX_CONCURRENT) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    await new Promise(resolve => setTimeout(resolve, 200));   // shorter wait
   }
   try {
     activeRequests.add(url);
@@ -56,7 +56,7 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// ============== Duration helper (unchanged) ==============
+// ---------- Duration helper ----------
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   const ids = videoIds.join(',');
@@ -92,7 +92,7 @@ app.get('/get', async (req, res) => {
   if (cached) return res.send({ url: cached });
 
   try {
-    const result = await withRateLimit(url, () => extractUrl(url));
+    const result = await withRateLimit(url, () => extract(url));
     if (result) {
       setCache(url, result);
       return res.send({ url: result });
@@ -104,43 +104,39 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// ============== Faster extraction ==============
-async function extractUrl(url) {
-  const userAgent = getRandomUserAgent();
-  // 🔥 Use pre‑muxed stream (single file, ≤720p) – much faster to resolve
-  const command = `yt-dlp --user-agent "${userAgent}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`;
-  console.log(`Extracting: ${command}`);
+// ==================== ROBUST EXTRACTION ====================
+async function extract(url) {
+  const ua = getRandomUserAgent();
+  const commands = [
+    // 1st: pre‑muxed stream ≤ 720p (fast & safe)
+    `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`,
+    // 2nd: any format (no height limit)
+    `yt-dlp --user-agent "${ua}" -g "${url}"`,
+  ];
 
-  // Only wait 20 seconds (was 30)
-  try {
-    const result = await new Promise((resolve, reject) => {
-      exec(command, { timeout: 20000 }, (error, stdout, stderr) => {
-        if (error) reject({ error, stderr });
-        else resolve(stdout.trim());
-      });
-    });
-    const directUrl = result;
-    if (directUrl && directUrl.startsWith('http')) {
-      return directUrl;
-    }
-    throw new Error('No valid URL');
-  } catch (err) {
-    // Quick fallback with ios client
+  for (const cmd of commands) {
+    console.log(`Trying: ${cmd}`);
     try {
-      const iosCommand = `yt-dlp --user-agent "${getRandomUserAgent()}" -g "${url}"`;
-      const result = await new Promise((resolve, reject) => {
-        exec(iosCommand, { timeout: 20000 }, (error, stdout, stderr) => {
-          if (error) reject({ error, stderr });
-          else resolve(stdout.trim());
-        });
-      });
-      const directUrl = result;
-      if (directUrl && directUrl.startsWith('http')) return directUrl;
+      const stdout = await runCommand(cmd);
+      const directUrl = stdout.trim();
+      if (directUrl && directUrl.startsWith('http')) {
+        console.log('Success');
+        return directUrl;
+      }
     } catch (e) {
-      console.error('iOS fallback also failed:', e.error?.message || e);
+      console.error(`Command failed: ${e.message || e}`);
     }
-    throw new Error('All extraction methods failed');
   }
+  throw new Error('All extraction commands failed');
+}
+
+function runCommand(command) {
+  return new Promise((resolve, reject) => {
+    exec(command, { timeout: 30000 }, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
 }
 
 // ==================== Search endpoint (unchanged) ====================
@@ -185,5 +181,5 @@ app.get('/search', async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Vortex proxy running on port ${port} (max cache: ${MAX_CACHE}, max concurrent: ${MAX_CONCURRENT})`);
+  console.log(`Vortex proxy running on port ${port}`);
 });
