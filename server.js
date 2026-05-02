@@ -6,7 +6,7 @@ const port = process.env.PORT || 3000;
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-// ------------------- User‑agents and cache (unchanged) -------------------
+// ------------------- User‑agents (unchanged) -------------------
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -16,7 +16,7 @@ const userAgents = [
 ];
 
 const cache = new Map();
-const CACHE_TTL = 10 * 60 * 1000;
+const CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
 
 function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
@@ -35,7 +35,7 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ------------------- Duration helper -------------------
+// ------------------- Duration helper (unchanged) -------------------
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   const ids = videoIds.join(',');
@@ -49,7 +49,7 @@ async function getVideoDurations(videoIds) {
     });
     const durationMap = {};
     response.data.items.forEach(item => {
-      durationMap[item.id] = item.contentDetails.duration;   // ISO 8601, e.g. PT4M13S
+      durationMap[item.id] = item.contentDetails.duration;
     });
     return durationMap;
   } catch (err) {
@@ -63,7 +63,9 @@ app.get('/status', (req, res) => {
   res.send({ status: 'ok', cacheSize: cache.size });
 });
 
-// ------------------- Main extraction endpoint (unchanged) -------------------
+// ===================================================================
+//               FAST /get endpoint (android only, no delay)
+// ===================================================================
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send({ error: 'Missing url parameter' });
@@ -71,20 +73,32 @@ app.get('/get', async (req, res) => {
   const cached = getFromCache(url);
   if (cached) return res.send({ url: cached });
 
-  const clients = ['android', 'ios', 'web', 'mweb'];
-  let lastError = null;
+  const userAgent = getRandomUserAgent();
+  const command = `yt-dlp --user-agent "${userAgent}" --extractor-args youtube:player_client=android -g "${url}"`;
+  console.log(`Extracting: ${command}`);
 
-  for (const client of clients) {
-    const delay = Math.floor(Math.random() * 3000) + 1000;
-    await new Promise(resolve => setTimeout(resolve, delay));
-
-    const userAgent = getRandomUserAgent();
-    const command = `yt-dlp --user-agent "${userAgent}" --extractor-args youtube:player_client=${client} --sleep-requests 2 -g "${url}"`;
-    console.log(`Trying client ${client} with UA ${userAgent}`);
-
+  try {
+    const result = await new Promise((resolve, reject) => {
+      exec(command, { timeout: 30000 }, (error, stdout, stderr) => {
+        if (error) reject({ error, stderr });
+        else resolve(stdout.trim());
+      });
+    });
+    const directUrl = result;
+    if (directUrl && directUrl.startsWith('http')) {
+      setCache(url, directUrl);
+      console.log(`Success for ${url}`);
+      return res.send({ url: directUrl });
+    }
+    throw new Error('No valid URL returned');
+  } catch (err) {
+    // If android client fails, try the 'ios' client once without delay
+    console.error(`Android client failed, trying ios client...`);
     try {
+      const iosUA = getRandomUserAgent();
+      const iosCmd = `yt-dlp --user-agent "${iosUA}" --extractor-args youtube:player_client=ios -g "${url}"`;
       const result = await new Promise((resolve, reject) => {
-        exec(command, { timeout: 30000 }, (error, stdout, stderr) => {
+        exec(iosCmd, { timeout: 30000 }, (error, stdout, stderr) => {
           if (error) reject({ error, stderr });
           else resolve(stdout.trim());
         });
@@ -92,24 +106,23 @@ app.get('/get', async (req, res) => {
       const directUrl = result;
       if (directUrl && directUrl.startsWith('http')) {
         setCache(url, directUrl);
-        console.log(`Success with client ${client}`);
+        console.log(`Success with ios client for ${url}`);
         return res.send({ url: directUrl });
       }
-    } catch (err) {
-      console.error(`Client ${client} failed: ${err.error?.message || err}`);
-      lastError = err;
+    } catch (e) {
+      console.error('iOS fallback also failed:', e.error?.message || e);
     }
-  }
 
-  console.error(`All clients failed for ${url}`);
-  return res.status(500).send({
-    error: 'Failed to extract video URL',
-    details: lastError?.stderr || 'Unknown error',
-  });
+    console.error(`All extraction attempts failed for ${url}`);
+    return res.status(500).send({
+      error: 'Failed to extract video URL',
+      details: err.stderr || 'Unknown error',
+    });
+  }
 });
 
 // ===================================================================
-//                     Search endpoint with durations
+//                     Search endpoint (unchanged)
 // ===================================================================
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
@@ -129,8 +142,6 @@ app.get('/search', async (req, res) => {
 
     const items = response.data.items;
     const videoIds = items.map(item => item.id.videoId);
-
-    // Fetch durations for all video IDs in this page
     const durationMap = await getVideoDurations(videoIds);
 
     const videos = items.map(item => ({
