@@ -14,29 +14,23 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// ---------- Cache (unchanged) ----------
+// Cache
 const MAX_CACHE = 100;
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
 
 function getFromCache(url) {
   const entry = cache.get(url);
-  if (entry && Date.now() - entry.timestamp < CACHE_TTL) {
-    console.log(`Cache hit for ${url}`);
-    return entry.directUrl;
-  }
+  if (entry && Date.now() - entry.timestamp < CACHE_TTL) return entry.directUrl;
   return null;
 }
 
 function setCache(url, directUrl) {
-  if (cache.size >= MAX_CACHE) {
-    const oldestKey = cache.keys().next().value;
-    cache.delete(oldestKey);
-  }
+  if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value);
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// ---------- Rate limiter ----------
+// Rate limiter
 const activeRequests = new Set();
 const MAX_CONCURRENT = 3;
 
@@ -56,130 +50,88 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// ---------- Search helpers ----------
+// Search helpers
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
-  const ids = videoIds.join(',');
   try {
-    const response = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
-      params: {
-        part: 'contentDetails',
-        id: ids,
-        key: YOUTUBE_API_KEY,
-      },
+    const resp = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+      params: { part: 'contentDetails', id: videoIds.join(','), key: YOUTUBE_API_KEY },
     });
-    const durationMap = {};
-    response.data.items.forEach(item => {
-      durationMap[item.id] = item.contentDetails.duration;
-    });
-    return durationMap;
-  } catch (err) {
-    console.error('Failed to fetch video durations:', err.message);
-    return {};
-  }
+    const map = {};
+    resp.data.items.forEach(i => map[i.id] = i.contentDetails.duration);
+    return map;
+  } catch (e) { return {}; }
 }
 
-// ==================== Endpoints ====================
-app.get('/status', (req, res) => {
-  res.send({ status: 'ok', cacheSize: cache.size, activeRequests: activeRequests.size });
-});
+// Endpoints
+app.get('/status', (req, res) => res.send({ status: 'ok', cacheSize: cache.size }));
 
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send({ error: 'Missing url parameter' });
-
   const cached = getFromCache(url);
   if (cached) return res.send({ url: cached });
-
   try {
     const result = await withRateLimit(url, () => extract(url));
     if (result) {
       setCache(url, result);
       return res.send({ url: result });
     }
-    return res.status(500).send({ error: 'Failed to extract video URL' });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send({ error: 'Internal error' });
+    return res.status(500).send({ error: 'Failed' });
+  } catch (e) {
+    return res.status(500).send({ error: 'Failed' });
   }
 });
 
-// ============== FAST EXTRACTION ==============
+// Fast extraction: 8s per attempt, only two commands
 async function extract(url) {
   const ua = getRandomUserAgent();
-  // First command: fast 720p android format – 12s timeout
-  const cmd1 = `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`;
-  console.log(`Trying (12s): ${cmd1}`);
+  // 1st: fast android 720p format
+  let cmd = `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`;
   try {
-    const directUrl = await runCommand(cmd1, 12000);
-    if (directUrl && directUrl.startsWith('http')) return directUrl;
-  } catch (e) {
-    console.error('First command failed:', e.message);
-  }
+    const out = await runCommand(cmd, 8000);
+    if (out && out.startsWith('http')) return out;
+  } catch (e) {}
 
-  // Second command: any format, no height limit – 12s timeout
-  const cmd2 = `yt-dlp --user-agent "${ua}" -g "${url}"`;
-  console.log(`Trying fallback (12s): ${cmd2}`);
+  // 2nd: any format, 8s timeout
+  cmd = `yt-dlp --user-agent "${ua}" -g "${url}"`;
   try {
-    const directUrl = await runCommand(cmd2, 12000);
-    if (directUrl && directUrl.startsWith('http')) return directUrl;
-  } catch (e) {
-    console.error('Fallback command failed:', e.message);
-  }
+    const out = await runCommand(cmd, 8000);
+    if (out && out.startsWith('http')) return out;
+  } catch (e) {}
 
-  throw new Error('All extraction commands failed');
+  throw new Error('All commands failed');
 }
 
 function runCommand(command, timeoutMs) {
   return new Promise((resolve, reject) => {
-    exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
+    exec(command, { timeout: timeoutMs }, (error, stdout) => {
       if (error) reject(error);
       else resolve(stdout.trim());
     });
   });
 }
 
-// ==================== Search endpoint (unchanged) ====================
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
-  if (!q) return res.status(400).json({ error: 'Missing query parameter q' });
-
+  if (!q) return res.status(400).json({ error: 'q required' });
   try {
-    const response = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-      params: {
-        part: 'snippet',
-        maxResults: 20,
-        q,
-        type: 'video',
-        key: YOUTUBE_API_KEY,
-        pageToken: pageToken || undefined,
-      },
+    const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+      params: { part: 'snippet', maxResults: 20, q, type: 'video', key: YOUTUBE_API_KEY, pageToken },
     });
-
-    const items = response.data.items;
-    const videoIds = items.map(item => item.id.videoId);
-    const durationMap = await getVideoDurations(videoIds);
-
-    const videos = items.map(item => ({
-      videoId: item.id.videoId,
-      title: item.snippet.title,
-      author: item.snippet.channelTitle,
-      thumbnail: item.snippet.thumbnails.high?.url ||
-                 item.snippet.thumbnails.medium?.url ||
-                 item.snippet.thumbnails.default?.url,
-      duration: durationMap[item.id.videoId] || 'Unknown',
+    const items = resp.data.items;
+    const durations = await getVideoDurations(items.map(i => i.id.videoId));
+    const videos = items.map(i => ({
+      videoId: i.id.videoId,
+      title: i.snippet.title,
+      author: i.snippet.channelTitle,
+      thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
+      duration: durations[i.id.videoId] || 'Unknown',
     }));
-
-    res.json({
-      videos,
-      nextPageToken: response.data.nextPageToken || null,
-    });
-  } catch (error) {
-    console.error('YouTube search proxy error:', error.response?.data || error.message);
+    res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
+  } catch (e) {
     res.status(500).json({ error: 'Search failed' });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Vortex proxy running on port ${port}`);
-});
+app.listen(port, () => console.log(`Proxy running on ${port}`));
