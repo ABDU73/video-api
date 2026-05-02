@@ -14,7 +14,7 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// Cache
+// Cache (max 100 entries, 10 min TTL)
 const MAX_CACHE = 100;
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
@@ -30,7 +30,7 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// Rate limiter
+// Rate limiter (max 3 parallel yt‑dlp processes)
 const activeRequests = new Set();
 const MAX_CONCURRENT = 3;
 
@@ -50,6 +50,7 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
+// search helper
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   try {
@@ -62,6 +63,7 @@ async function getVideoDurations(videoIds) {
   } catch (e) { return {}; }
 }
 
+// Endpoints
 app.get('/status', (req, res) => res.send({ status: 'ok', cacheSize: cache.size }));
 
 app.get('/get', async (req, res) => {
@@ -69,44 +71,58 @@ app.get('/get', async (req, res) => {
   if (!url) return res.status(400).send({ error: 'Missing url parameter' });
   const cached = getFromCache(url);
   if (cached) return res.send({ url: cached });
+
   try {
     const result = await withRateLimit(url, () => extract(url));
     if (result) {
       setCache(url, result);
       return res.send({ url: result });
     }
-    return res.status(500).send({ error: 'Failed' });
+    return res.status(500).send({ error: 'Failed to extract video URL' });
   } catch (e) {
-    return res.status(500).send({ error: 'Failed' });
+    console.error('Extraction error:', e.message || e);
+    return res.status(500).send({ error: 'Internal error' });
   }
 });
 
 async function extract(url) {
   const ua = getRandomUserAgent();
-  let cmd = `yt-dlp --user-agent "${ua}" -f "best[height<=720]" --extractor-args "youtube:player_client=android" -g "${url}"`;
-  try {
-    const out = await runCommand(cmd, 8000);
-    if (out && out.startsWith('http')) return out;
-  } catch (e) {}
 
-  cmd = `yt-dlp --user-agent "${ua}" -g "${url}"`;
-  try {
-    const out = await runCommand(cmd, 8000);
-    if (out && out.startsWith('http')) return out;
-  } catch (e) {}
+  // List of format strings to try, from most compatible to least
+  const formats = [
+    `best[height<=720]`,               // pre‑muxed 720p (fast and works almost always)
+    `best[height<=480]`,               // fallback to lower resolution
+    `best`,                            // any format
+  ];
 
-  throw new Error('All commands failed');
+  for (const fmt of formats) {
+    const cmd = `yt-dlp --user-agent "${ua}" -f "${fmt}" --extractor-args "youtube:player_client=android" -g "${url}"`;
+    console.log(`Trying format "${fmt}"...`);
+    try {
+      const output = await runCommand(cmd, 20000);   // 20 seconds timeout
+      const directUrl = output.trim();
+      if (directUrl && directUrl.startsWith('http')) {
+        console.log(`Success with format "${fmt}"`);
+        return directUrl;
+      }
+    } catch (e) {
+      console.error(`Format "${fmt}" failed: ${e.message}`);
+    }
+  }
+
+  throw new Error('All extraction formats failed');
 }
 
 function runCommand(command, timeoutMs) {
   return new Promise((resolve, reject) => {
     exec(command, { timeout: timeoutMs }, (error, stdout) => {
       if (error) reject(error);
-      else resolve(stdout.trim());
+      else resolve(stdout);
     });
   });
 }
 
+// Search endpoint (unchanged)
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
@@ -129,4 +145,4 @@ app.get('/search', async (req, res) => {
   }
 });
 
-app.listen(port, () => console.log(`Proxy running on ${port}`));
+app.listen(port, () => console.log(`Vortex proxy running on port ${port}`));
