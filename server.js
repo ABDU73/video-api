@@ -5,7 +5,8 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const COOKIEFILE = process.env.COOKIEFILE || '';   // path to cookies.txt (e.g. /usr/src/app/cookies.txt)
+// Not using cookies for this test
+// const COOKIEFILE = process.env.COOKIEFILE || '';
 
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -15,7 +16,7 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// Cache: 500 entries, 1‑hour TTL
+// Cache
 const MAX_CACHE = 500;
 const cache = new Map();
 const CACHE_TTL = 60 * 60 * 1000;
@@ -27,111 +28,64 @@ function getFromCache(url) {
 }
 
 function setCache(url, directUrl) {
-  if (cache.size >= MAX_CACHE) {
-    const oldestKey = cache.keys().next().value;
-    cache.delete(oldestKey);
-  }
+  if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value);
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
 // Rate limiter
 const activeRequests = new Set();
 const MAX_CONCURRENT = 3;
-
 async function withRateLimit(url, fn) {
-  while (activeRequests.size >= MAX_CONCURRENT) {
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-  try {
-    activeRequests.add(url);
-    return await fn();
-  } finally {
-    activeRequests.delete(url);
-  }
+  while (activeRequests.size >= MAX_CONCURRENT) await new Promise(resolve => setTimeout(resolve, 200));
+  try { activeRequests.add(url); return await fn(); } finally { activeRequests.delete(url); }
 }
 
 function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// ---------- Search helpers ----------
-async function getVideoDurations(videoIds) {
-  if (!videoIds.length) return {};
-  try {
-    const resp = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
-      params: { part: 'contentDetails', id: videoIds.join(','), key: YOUTUBE_API_KEY },
-    });
-    const map = {};
-    resp.data.items.forEach(i => map[i.id] = i.contentDetails.duration);
-    return map;
-  } catch (e) { return {}; }
-}
+// ---------- /test – does yt-dlp work? ----------
+app.get('/test', (req, res) => {
+  exec('yt-dlp --version', { timeout: 10000 }, (error, stdout, stderr) => {
+    if (error) {
+      console.error('yt-dlp version error:', error.message, 'stderr:', stderr);
+      return res.json({ status: 'error', message: error.message, stderr: stderr });
+    }
+    res.json({ status: 'ok', version: stdout.trim() });
+  });
+});
 
-// ---------- Extraction logic (with cookies, JS runtime, and detailed logging) ----------
+// ---------- Simple extraction – just one format, no cookies ----------
 async function extract(url) {
   const ua = getRandomUserAgent();
-  const cookieArg = COOKIEFILE ? `--cookies "${COOKIEFILE}"` : '';
+  // Basic command without cookies or js-runtimes
+  const cmd = `yt-dlp --user-agent "${ua}" -f "best[height<=480]" --extractor-args "youtube:player_client=android" -g "${url}"`;
+  console.log('Running:', cmd);
 
-  const formats = [
-    `best[height<=480]`,
-    `best[height<=720]`,
-    `best`,
-  ];
-
-  let lastError = '';
-  for (const fmt of formats) {
-    const cmd = `yt-dlp --user-agent "${ua}" ${cookieArg} -f "${fmt}" --extractor-args "youtube:player_client=android" --js-runtimes node -g "${url}"`;
-    console.log(`Trying format "${fmt}"...`);
-    try {
-      const output = await runCommand(cmd, 20000);   // 20 seconds timeout (a bit more)
-      const directUrl = output.trim();
-      if (directUrl && directUrl.startsWith('http')) {
-        console.log(`Success with format "${fmt}"`);
-        return directUrl;
-      }
-    } catch (e) {
-      lastError = e.stderr || e.message || String(e);
-      console.error(`Format "${fmt}" failed:`, lastError);
-    }
-  }
-
-  console.error('All extraction formats failed. Last error:', lastError);
-  throw new Error('All extraction formats failed');
-}
-
-function runCommand(command, timeoutMs) {
   return new Promise((resolve, reject) => {
-    exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
+    exec(cmd, { timeout: 20000 }, (error, stdout, stderr) => {
       if (error) {
-        // Attach stderr to the error for logging
-        error.stderr = stderr;
-        reject(error);
+        console.error('yt-dlp error:', error.message);
+        console.error('stderr:', stderr);
+        return reject(new Error(stderr || error.message));
+      }
+      const directUrl = stdout.trim();
+      if (directUrl && directUrl.startsWith('http')) {
+        resolve(directUrl);
       } else {
-        resolve(stdout);
+        reject(new Error('No direct URL in output: ' + stdout));
       }
     });
   });
 }
 
-// ---------- Pre‑cache ----------
-function preCacheVideo(youtubeUrl) {
-  if (getFromCache(youtubeUrl)) return;
-  withRateLimit(youtubeUrl, () => extract(youtubeUrl))
-    .then(directUrl => setCache(youtubeUrl, directUrl))
-    .catch(() => {});
-}
-
-// ---------- Endpoints ----------
-app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size }));
-
+// ---------- /get ----------
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
 
   const cached = getFromCache(url);
-  if (cached) {
-    return res.json({ url: cached });
-  }
+  if (cached) return res.json({ url: cached });
 
   try {
     const result = await withRateLimit(url, () => extract(url));
@@ -141,22 +95,31 @@ app.get('/get', async (req, res) => {
     }
     return res.status(500).json({ error: 'Failed to extract video URL' });
   } catch (e) {
-    console.error('Extraction error:', e.message || e);
+    console.error('Extraction error:', e.message);
     return res.status(500).json({ error: 'Internal error' });
   }
 });
 
+// ---------- /search (unchanged, but we can leave it) ----------
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
-
   try {
     const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
       params: { part: 'snippet', maxResults: 20, q, type: 'video', key: YOUTUBE_API_KEY, pageToken },
     });
     const items = resp.data.items;
-    const durations = await getVideoDurations(items.map(i => i.id.videoId));
-
+    const durations = await (async () => {
+      if (!items.length) return {};
+      try {
+        const durResp = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+          params: { part: 'contentDetails', id: items.map(i => i.id.videoId).join(','), key: YOUTUBE_API_KEY },
+        });
+        const map = {};
+        durResp.data.items.forEach(i => map[i.id] = i.contentDetails.duration);
+        return map;
+      } catch (e) { return {}; }
+    })();
     const videos = items.map(i => ({
       videoId: i.id.videoId,
       title: i.snippet.title,
@@ -164,14 +127,7 @@ app.get('/search', async (req, res) => {
       thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
       duration: durations[i.id.videoId] || 'Unknown',
     }));
-
     res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
-
-    videos.forEach(v => {
-      const youtubeUrl = `https://www.youtube.com/watch?v=${v.videoId}`;
-      preCacheVideo(youtubeUrl);
-    });
-
   } catch (e) {
     res.status(500).json({ error: 'Search failed' });
   }
