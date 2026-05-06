@@ -14,10 +14,10 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// Cache (max 100 entries, 10 min TTL)
-const MAX_CACHE = 100;
+// Cache: 500 entries, 1‑hour TTL (was 100 / 10 min)
+const MAX_CACHE = 500;
 const cache = new Map();
-const CACHE_TTL = 10 * 60 * 1000;
+const CACHE_TTL = 60 * 60 * 1000;           // 1 hour
 
 function getFromCache(url) {
   const entry = cache.get(url);
@@ -26,11 +26,15 @@ function getFromCache(url) {
 }
 
 function setCache(url, directUrl) {
-  if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value);
+  if (cache.size >= MAX_CACHE) {
+    // delete the oldest entry
+    const oldestKey = cache.keys().next().value;
+    cache.delete(oldestKey);
+  }
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// Rate limiter (max 3 parallel yt‑dlp processes)
+// Rate limiter
 const activeRequests = new Set();
 const MAX_CONCURRENT = 3;
 
@@ -50,7 +54,7 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// search helper
+// ---------- Search helpers ----------
 async function getVideoDurations(videoIds) {
   if (!videoIds.length) return {};
   try {
@@ -63,50 +67,27 @@ async function getVideoDurations(videoIds) {
   } catch (e) { return {}; }
 }
 
-// Endpoints
-app.get('/status', (req, res) => res.send({ status: 'ok', cacheSize: cache.size }));
-
-app.get('/get', async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).send({ error: 'Missing url parameter' });
-  const cached = getFromCache(url);
-  if (cached) return res.send({ url: cached });
-
-  try {
-    const result = await withRateLimit(url, () => extract(url));
-    if (result) {
-      setCache(url, result);
-      return res.send({ url: result });
-    }
-    return res.status(500).send({ error: 'Failed to extract video URL' });
-  } catch (e) {
-    console.error('Extraction error:', e.message || e);
-    return res.status(500).send({ error: 'Internal error' });
-  }
-});
-
+// ---------- Extraction logic (unchanged) ----------
 async function extract(url) {
   const ua = getRandomUserAgent();
 
-  // List of format strings to try, from most compatible to least
+  // Try the fastest resolution first (480p), then fallback
   const formats = [
-    `best[height<=720]`,               // pre‑muxed 720p (fast and works almost always)
-    `best[height<=480]`,               // fallback to lower resolution
-    `best`,                            // any format
+    `best[height<=480]`,    // fastest to extract, still looks good on mobile
+    `best[height<=720]`,
+    `best`,
   ];
 
   for (const fmt of formats) {
     const cmd = `yt-dlp --user-agent "${ua}" -f "${fmt}" --extractor-args "youtube:player_client=android" -g "${url}"`;
-    console.log(`Trying format "${fmt}"...`);
     try {
-      const output = await runCommand(cmd, 20000);   // 20 seconds timeout
+      const output = await runCommand(cmd, 15000);   // 15 seconds timeout (faster fail)
       const directUrl = output.trim();
       if (directUrl && directUrl.startsWith('http')) {
-        console.log(`Success with format "${fmt}"`);
         return directUrl;
       }
     } catch (e) {
-      console.error(`Format "${fmt}" failed: ${e.message}`);
+      // try next format
     }
   }
 
@@ -122,16 +103,52 @@ function runCommand(command, timeoutMs) {
   });
 }
 
-// Search endpoint (unchanged)
+// ---------- Pre‑cache: extract all search results in the background ----------
+function preCacheVideo(youtubeUrl) {
+  if (getFromCache(youtubeUrl)) return;   // already cached
+
+  // Fire‑and‑forget, no waiting
+  withRateLimit(youtubeUrl, () => extract(youtubeUrl))
+    .then(directUrl => setCache(youtubeUrl, directUrl))
+    .catch(() => {});   // ignore failures
+}
+
+// ---------- Endpoints ----------
+app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size }));
+
+app.get('/get', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing url parameter' });
+
+  const cached = getFromCache(url);
+  if (cached) {
+    return res.json({ url: cached });
+  }
+
+  try {
+    const result = await withRateLimit(url, () => extract(url));
+    if (result) {
+      setCache(url, result);
+      return res.json({ url: result });
+    }
+    return res.status(500).json({ error: 'Failed to extract video URL' });
+  } catch (e) {
+    console.error('Extraction error:', e.message || e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
+
   try {
     const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
       params: { part: 'snippet', maxResults: 20, q, type: 'video', key: YOUTUBE_API_KEY, pageToken },
     });
     const items = resp.data.items;
     const durations = await getVideoDurations(items.map(i => i.id.videoId));
+
     const videos = items.map(i => ({
       videoId: i.id.videoId,
       title: i.snippet.title,
@@ -139,7 +156,16 @@ app.get('/search', async (req, res) => {
       thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
       duration: durations[i.id.videoId] || 'Unknown',
     }));
+
+    // Respond immediately with the list
     res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
+
+    // 🔥 NOW start extracting all the video URLs in the background
+    videos.forEach(v => {
+      const youtubeUrl = `https://www.youtube.com/watch?v=${v.videoId}`;
+      preCacheVideo(youtubeUrl);
+    });
+
   } catch (e) {
     res.status(500).json({ error: 'Search failed' });
   }
