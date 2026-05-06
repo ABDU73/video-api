@@ -5,6 +5,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const COOKIEFILE = process.env.COOKIEFILE || '';   // ✅ reads the path we set on Render
 
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -14,10 +15,10 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// Cache: 500 entries, 1‑hour TTL (was 100 / 10 min)
+// Cache: 500 entries, 1‑hour TTL
 const MAX_CACHE = 500;
 const cache = new Map();
-const CACHE_TTL = 60 * 60 * 1000;           // 1 hour
+const CACHE_TTL = 60 * 60 * 1000;
 
 function getFromCache(url) {
   const entry = cache.get(url);
@@ -27,7 +28,6 @@ function getFromCache(url) {
 
 function setCache(url, directUrl) {
   if (cache.size >= MAX_CACHE) {
-    // delete the oldest entry
     const oldestKey = cache.keys().next().value;
     cache.delete(oldestKey);
   }
@@ -67,21 +67,21 @@ async function getVideoDurations(videoIds) {
   } catch (e) { return {}; }
 }
 
-// ---------- Extraction logic (unchanged) ----------
+// ---------- Extraction logic (with COOKIEFILE) ----------
 async function extract(url) {
   const ua = getRandomUserAgent();
+  const cookieArg = COOKIEFILE ? `--cookies "${COOKIEFILE}"` : '';   // ✅ uses cookies if available
 
-  // Try the fastest resolution first (480p), then fallback
   const formats = [
-    `best[height<=480]`,    // fastest to extract, still looks good on mobile
+    `best[height<=480]`,
     `best[height<=720]`,
     `best`,
   ];
 
   for (const fmt of formats) {
-    const cmd = `yt-dlp --user-agent "${ua}" -f "${fmt}" --extractor-args "youtube:player_client=android" -g "${url}"`;
+    const cmd = `yt-dlp --user-agent "${ua}" ${cookieArg} -f "${fmt}" --extractor-args "youtube:player_client=android" -g "${url}"`;
     try {
-      const output = await runCommand(cmd, 15000);   // 15 seconds timeout (faster fail)
+      const output = await runCommand(cmd, 15000);
       const directUrl = output.trim();
       if (directUrl && directUrl.startsWith('http')) {
         return directUrl;
@@ -105,12 +105,10 @@ function runCommand(command, timeoutMs) {
 
 // ---------- Pre‑cache: extract all search results in the background ----------
 function preCacheVideo(youtubeUrl) {
-  if (getFromCache(youtubeUrl)) return;   // already cached
-
-  // Fire‑and‑forget, no waiting
+  if (getFromCache(youtubeUrl)) return;
   withRateLimit(youtubeUrl, () => extract(youtubeUrl))
     .then(directUrl => setCache(youtubeUrl, directUrl))
-    .catch(() => {});   // ignore failures
+    .catch(() => {});
 }
 
 // ---------- Endpoints ----------
@@ -157,10 +155,8 @@ app.get('/search', async (req, res) => {
       duration: durations[i.id.videoId] || 'Unknown',
     }));
 
-    // Respond immediately with the list
     res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
 
-    // 🔥 NOW start extracting all the video URLs in the background
     videos.forEach(v => {
       const youtubeUrl = `https://www.youtube.com/watch?v=${v.videoId}`;
       preCacheVideo(youtubeUrl);
