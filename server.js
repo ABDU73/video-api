@@ -5,7 +5,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const COOKIEFILE = process.env.COOKIEFILE || '';   // ✅ reads the path we set on Render
+const COOKIEFILE = process.env.COOKIEFILE || '';   // path to cookies.txt (e.g. /usr/src/app/cookies.txt)
 
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -67,10 +67,10 @@ async function getVideoDurations(videoIds) {
   } catch (e) { return {}; }
 }
 
-// ---------- Extraction logic (with COOKIEFILE) ----------
+// ---------- Extraction logic (with cookies, JS runtime, and detailed logging) ----------
 async function extract(url) {
   const ua = getRandomUserAgent();
-  const cookieArg = COOKIEFILE ? `--cookies "${COOKIEFILE}"` : '';   // ✅ uses cookies if available
+  const cookieArg = COOKIEFILE ? `--cookies "${COOKIEFILE}"` : '';
 
   const formats = [
     `best[height<=480]`,
@@ -78,32 +78,42 @@ async function extract(url) {
     `best`,
   ];
 
+  let lastError = '';
   for (const fmt of formats) {
-    const cmd = `yt-dlp --user-agent "${ua}" ${cookieArg} -f "${fmt}" --extractor-args "youtube:player_client=android" -g "${url}"`;
+    const cmd = `yt-dlp --user-agent "${ua}" ${cookieArg} -f "${fmt}" --extractor-args "youtube:player_client=android" --js-runtimes node -g "${url}"`;
+    console.log(`Trying format "${fmt}"...`);
     try {
-      const output = await runCommand(cmd, 15000);
+      const output = await runCommand(cmd, 20000);   // 20 seconds timeout (a bit more)
       const directUrl = output.trim();
       if (directUrl && directUrl.startsWith('http')) {
+        console.log(`Success with format "${fmt}"`);
         return directUrl;
       }
     } catch (e) {
-      // try next format
+      lastError = e.stderr || e.message || String(e);
+      console.error(`Format "${fmt}" failed:`, lastError);
     }
   }
 
+  console.error('All extraction formats failed. Last error:', lastError);
   throw new Error('All extraction formats failed');
 }
 
 function runCommand(command, timeoutMs) {
   return new Promise((resolve, reject) => {
-    exec(command, { timeout: timeoutMs }, (error, stdout) => {
-      if (error) reject(error);
-      else resolve(stdout);
+    exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        // Attach stderr to the error for logging
+        error.stderr = stderr;
+        reject(error);
+      } else {
+        resolve(stdout);
+      }
     });
   });
 }
 
-// ---------- Pre‑cache: extract all search results in the background ----------
+// ---------- Pre‑cache ----------
 function preCacheVideo(youtubeUrl) {
   if (getFromCache(youtubeUrl)) return;
   withRateLimit(youtubeUrl, () => extract(youtubeUrl))
