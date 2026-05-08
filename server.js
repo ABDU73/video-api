@@ -11,8 +11,8 @@ const TOKENS_FILE = path.join(__dirname, 'tokens.json');
 const { refreshTokens } = require('./refresh-tokens');
 
 async function startTokenRefresh() {
-  await refreshTokens();
-  setInterval(refreshTokens, 2 * 60 * 60 * 1000); // refresh every 2 hours (just in case)
+  await refreshTokens();   // login now with Puppeteer
+  setInterval(refreshTokens, 2 * 60 * 60 * 1000); // keep alive
 }
 
 // ---------- yt-dlp extraction ----------
@@ -98,8 +98,10 @@ app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size 
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
+
   const cached = getFromCache(url);
   if (cached) return res.json({ url: cached });
+
   try {
     const result = await withRateLimit(url, () => extract(url));
     if (result) {
@@ -156,7 +158,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// Auth tokens endpoint – returns cookies from tokens.json
+// Auth tokens endpoint (returns cookies for Flutter, optional)
 app.get('/auth-tokens', (req, res) => {
   if (!fs.existsSync(TOKENS_FILE)) {
     return res.status(503).json({ error: 'Tokens not yet generated' });
@@ -167,5 +169,5 @@ app.get('/auth-tokens', (req, res) => {
 
 app.listen(port, () => {
   console.log(`Vortex proxy running on port ${port}`);
-  startTokenRefresh();   // begin automatic login
+  startTokenRefresh();   // begin automatic login with Puppeteer
 });
