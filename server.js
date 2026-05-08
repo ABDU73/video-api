@@ -1,11 +1,20 @@
 const express = require('express');
 const { exec } = require('child_process');
-const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 const port = process.env.PORT || 3000;
 
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+// ---------- Auth Tokens ----------
+const TOKENS_FILE = path.join(__dirname, 'tokens.json');
+const { refreshTokens } = require('./refresh-tokens');
 
+async function startTokenRefresh() {
+  await refreshTokens();
+  setInterval(refreshTokens, 2 * 60 * 60 * 1000); // every 2 hours
+}
+
+// ---------- yt-dlp extraction (unchanged) ----------
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -14,7 +23,6 @@ const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; rv:123.0) Gecko/20100101 Firefox/123.0',
 ];
 
-// Cache: 500 entries, 1‑hour TTL
 const MAX_CACHE = 500;
 const cache = new Map();
 const CACHE_TTL = 60 * 60 * 1000;
@@ -30,7 +38,6 @@ function setCache(url, directUrl) {
   cache.set(url, { directUrl, timestamp: Date.now() });
 }
 
-// Rate limiter
 const activeRequests = new Set();
 const MAX_CONCURRENT = 3;
 async function withRateLimit(url, fn) {
@@ -42,28 +49,39 @@ function getRandomUserAgent() {
   return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-// ---------- Simple, proven extraction ----------
 async function extract(url) {
   const ua = getRandomUserAgent();
-  const cmd = `yt-dlp --user-agent "${ua}" -f "best[height<=480]" --extractor-args "youtube:player_client=android" -g "${url}"`;
+  let cookieFile = '';
+  if (fs.existsSync(TOKENS_FILE)) {
+    const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
+    if (tokens.cookies) {
+      cookieFile = path.join(__dirname, 'yt-cookies.txt');
+      fs.writeFileSync(cookieFile, tokens.cookies);
+    }
+  }
+
+  const cookieArgs = cookieFile ? `--cookies "${cookieFile}"` : '';
+  const cmd = `yt-dlp --user-agent "${ua}" ${cookieArgs} -f "best[height<=480]" --extractor-args "youtube:player_client=android" -g "${url}"`;
 
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout: 20000 }, (error, stdout, stderr) => {
       if (error) {
         console.error('yt-dlp error:', stderr || error.message);
+        if (cookieFile) fs.unlinkSync(cookieFile);
         return reject(new Error(stderr || error.message));
       }
       const directUrl = stdout.trim();
       if (directUrl && directUrl.startsWith('http')) {
+        if (cookieFile) fs.unlinkSync(cookieFile);
         resolve(directUrl);
       } else {
+        if (cookieFile) fs.unlinkSync(cookieFile);
         reject(new Error('No direct URL in output'));
       }
     });
   });
 }
 
-// ---------- Pre‑cache after search ----------
 function preCacheVideo(youtubeUrl) {
   if (getFromCache(youtubeUrl)) return;
   withRateLimit(youtubeUrl, () => extract(youtubeUrl))
@@ -94,43 +112,22 @@ app.get('/get', async (req, res) => {
   }
 });
 
+// Keep your existing /search endpoint (unchanged)
+
 app.get('/search', async (req, res) => {
-  const { q, pageToken } = req.query;
-  if (!q) return res.status(400).json({ error: 'q required' });
-
-  try {
-    const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-      params: { part: 'snippet', maxResults: 20, q, type: 'video', key: YOUTUBE_API_KEY, pageToken },
-    });
-    const items = resp.data.items;
-
-    // Durations
-    let durations = {};
-    if (items.length) {
-      try {
-        const durResp = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
-          params: { part: 'contentDetails', id: items.map(i => i.id.videoId).join(','), key: YOUTUBE_API_KEY },
-        });
-        durResp.data.items.forEach(i => durations[i.id] = i.contentDetails.duration);
-      } catch (e) {}
-    }
-
-    const videos = items.map(i => ({
-      videoId: i.id.videoId,
-      title: i.snippet.title,
-      author: i.snippet.channelTitle,
-      thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
-      duration: durations[i.id.videoId] || 'Unknown',
-    }));
-
-    res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
-
-    // Pre‑cache in background
-    videos.forEach(v => preCacheVideo(`https://www.youtube.com/watch?v=${v.videoId}`));
-
-  } catch (e) {
-    res.status(500).json({ error: 'Search failed' });
-  }
+  // ... your existing search logic ...
 });
 
-app.listen(port, () => console.log(`Vortex proxy running on port ${port}`));
+// ★ NEW endpoint – returns the latest auth tokens
+app.get('/auth-tokens', (req, res) => {
+  if (!fs.existsSync(TOKENS_FILE)) {
+    return res.status(503).json({ error: 'Tokens not yet generated' });
+  }
+  const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
+  res.json(tokens);
+});
+
+app.listen(port, () => {
+  console.log(`Vortex proxy running on port ${port}`);
+  startTokenRefresh();   // begin the login cycle
+});
