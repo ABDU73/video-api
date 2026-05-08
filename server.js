@@ -6,16 +6,34 @@ const path = require('path');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ---------- Auth Tokens ----------
-const TOKENS_FILE = path.join(__dirname, 'tokens.json');
-const { refreshTokens } = require('./refresh-tokens');
+// ---------- Configuration ----------
+const AUTH_FILE = path.join(__dirname, 'oauth.json');  // yt‑dlp stores tokens here
 
-async function startTokenRefresh() {
-  await refreshTokens();
-  setInterval(refreshTokens, 2 * 60 * 60 * 1000);
+// Run the OAuth login on first start (only once)
+async function authorizeYouTube() {
+  if (fs.existsSync(AUTH_FILE)) {
+    console.log('✅ OAuth tokens already exist – skipping login');
+    return;
+  }
+
+  console.log('🔐 Starting YouTube OAuth login...');
+  const cmd = `yt-dlp --oauth2 --username "${process.env.YT_EMAIL}" --password "${process.env.YT_PASSWORD}" --netrc-cmd '' --output-auth "${AUTH_FILE}" "https://www.youtube.com/watch?v=dQw4w9WgXcQ"`;
+
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: 60000 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error('❌ OAuth login failed:', stderr || error.message);
+        // Don't reject – we'll fall back to env cookies
+        resolve();
+      } else {
+        console.log('🎉 OAuth tokens saved successfully');
+        resolve();
+      }
+    });
+  });
 }
 
-// ---------- yt-dlp extraction ----------
+// ---------- yt‑dlp extraction (uses OAuth cookies automatically) ----------
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -52,31 +70,40 @@ function getRandomUserAgent() {
 
 async function extract(url) {
   const ua = getRandomUserAgent();
-  let cookieFile = '';
-  if (fs.existsSync(TOKENS_FILE)) {
-    const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-    if (tokens.cookies) {
-      cookieFile = path.join(__dirname, 'yt-cookies.txt');
-      fs.writeFileSync(cookieFile, tokens.cookies);
-    }
+
+  // Use OAuth cookies if they exist
+  const authArgs = fs.existsSync(AUTH_FILE)
+    ? `--cookies-from-browser none --cookies "${AUTH_FILE}"`  // yt‑dlp can read its own auth file
+    : (process.env.YOUTUBE_COOKIES
+        ? `--cookies /tmp/yt-cookies.txt`
+        : '');
+
+  // Write env cookies to a temp file if OAuth is not available
+  if (!fs.existsSync(AUTH_FILE) && process.env.YOUTUBE_COOKIES) {
+    fs.writeFileSync('/tmp/yt-cookies.txt', process.env.YOUTUBE_COOKIES);
   }
 
-  const cookieArgs = cookieFile ? `--cookies "${cookieFile}"` : '';
-  const cmd = `yt-dlp --user-agent "${ua}" ${cookieArgs} -f "best[height<=480]" --extractor-args "youtube:player_client=android" -g "${url}"`;
+  const cmd = `yt-dlp --user-agent "${ua}" ${authArgs} -f "best[height<=480]" --extractor-args "youtube:player_client=android" -g "${url}"`;
 
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout: 20000 }, (error, stdout, stderr) => {
       if (error) {
         console.error('yt-dlp error:', stderr || error.message);
-        if (cookieFile) fs.unlinkSync(cookieFile);
+        if (!fs.existsSync(AUTH_FILE) && process.env.YOUTUBE_COOKIES) {
+          fs.unlinkSync('/tmp/yt-cookies.txt');
+        }
         return reject(new Error(stderr || error.message));
       }
       const directUrl = stdout.trim();
       if (directUrl && directUrl.startsWith('http')) {
-        if (cookieFile) fs.unlinkSync(cookieFile);
+        if (!fs.existsSync(AUTH_FILE) && process.env.YOUTUBE_COOKIES) {
+          fs.unlinkSync('/tmp/yt-cookies.txt');
+        }
         resolve(directUrl);
       } else {
-        if (cookieFile) fs.unlinkSync(cookieFile);
+        if (!fs.existsSync(AUTH_FILE) && process.env.YOUTUBE_COOKIES) {
+          fs.unlinkSync('/tmp/yt-cookies.txt');
+        }
         reject(new Error('No direct URL in output'));
       }
     });
@@ -111,11 +138,10 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// ✅ COMPLETE /search endpoint using YouTube Data API
+// ✅ Complete /search endpoint
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
-
   try {
     const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
       params: {
@@ -128,8 +154,6 @@ app.get('/search', async (req, res) => {
       },
     });
     const items = resp.data.items;
-
-    // Fetch durations
     let durations = {};
     if (items.length) {
       try {
@@ -143,7 +167,6 @@ app.get('/search', async (req, res) => {
         durResp.data.items.forEach(i => durations[i.id] = i.contentDetails.duration);
       } catch (e) {}
     }
-
     const videos = items.map(i => ({
       videoId: i.id.videoId,
       title: i.snippet.title,
@@ -151,26 +174,33 @@ app.get('/search', async (req, res) => {
       thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
       duration: durations[i.id.videoId] || 'Unknown',
     }));
-
     res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
-
-    // Pre‑cache in background
     videos.forEach(v => preCacheVideo(`https://www.youtube.com/watch?v=${v.videoId}`));
   } catch (e) {
     res.status(500).json({ error: 'Search failed' });
   }
 });
 
-// Auth tokens endpoint
+// Auth tokens endpoint – returns OAuth cookies if available, else env cookies
 app.get('/auth-tokens', (req, res) => {
-  if (!fs.existsSync(TOKENS_FILE)) {
-    return res.status(503).json({ error: 'Tokens not yet generated' });
+  // We'll read the OAuth token file and convert it to a cookie string
+  if (fs.existsSync(AUTH_FILE)) {
+    try {
+      const authData = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf-8'));
+      // yt‑dlp OAuth file contains refresh_token, access_token, etc.
+      // We'll just pass the entire JSON – your Flutter app can use it
+      res.json({ auth: authData, mode: 'oauth' });
+    } catch (e) {
+      res.json({ cookies: process.env.YOUTUBE_COOKIES || '', mode: 'cookies' });
+    }
+  } else {
+    res.json({ cookies: process.env.YOUTUBE_COOKIES || '', mode: 'cookies' });
   }
-  const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-  res.json(tokens);
 });
 
-app.listen(port, () => {
-  console.log(`Vortex proxy running on port ${port}`);
-  startTokenRefresh();
+// Start server after OAuth login
+authorizeYouTube().then(() => {
+  app.listen(port, () => {
+    console.log(`Vortex proxy running on port ${port}`);
+  });
 });
