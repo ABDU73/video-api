@@ -1,4 +1,5 @@
 const express = require('express');
+const axios = require('axios');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -11,10 +12,10 @@ const { refreshTokens } = require('./refresh-tokens');
 
 async function startTokenRefresh() {
   await refreshTokens();
-  setInterval(refreshTokens, 2 * 60 * 60 * 1000); // every 2 hours
+  setInterval(refreshTokens, 2 * 60 * 60 * 1000);
 }
 
-// ---------- yt-dlp extraction (unchanged) ----------
+// ---------- yt-dlp extraction ----------
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -95,10 +96,8 @@ app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size 
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
-
   const cached = getFromCache(url);
   if (cached) return res.json({ url: cached });
-
   try {
     const result = await withRateLimit(url, () => extract(url));
     if (result) {
@@ -112,13 +111,57 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// Keep your existing /search endpoint (unchanged)
-
+// ✅ COMPLETE /search endpoint using YouTube Data API
 app.get('/search', async (req, res) => {
-  // ... your existing search logic ...
+  const { q, pageToken } = req.query;
+  if (!q) return res.status(400).json({ error: 'q required' });
+
+  try {
+    const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+      params: {
+        part: 'snippet',
+        maxResults: 20,
+        q,
+        type: 'video',
+        key: process.env.YOUTUBE_API_KEY,
+        pageToken,
+      },
+    });
+    const items = resp.data.items;
+
+    // Fetch durations
+    let durations = {};
+    if (items.length) {
+      try {
+        const durResp = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+          params: {
+            part: 'contentDetails',
+            id: items.map(i => i.id.videoId).join(','),
+            key: process.env.YOUTUBE_API_KEY,
+          },
+        });
+        durResp.data.items.forEach(i => durations[i.id] = i.contentDetails.duration);
+      } catch (e) {}
+    }
+
+    const videos = items.map(i => ({
+      videoId: i.id.videoId,
+      title: i.snippet.title,
+      author: i.snippet.channelTitle,
+      thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
+      duration: durations[i.id.videoId] || 'Unknown',
+    }));
+
+    res.json({ videos, nextPageToken: resp.data.nextPageToken || null });
+
+    // Pre‑cache in background
+    videos.forEach(v => preCacheVideo(`https://www.youtube.com/watch?v=${v.videoId}`));
+  } catch (e) {
+    res.status(500).json({ error: 'Search failed' });
+  }
 });
 
-// ★ NEW endpoint – returns the latest auth tokens
+// Auth tokens endpoint
 app.get('/auth-tokens', (req, res) => {
   if (!fs.existsSync(TOKENS_FILE)) {
     return res.status(503).json({ error: 'Tokens not yet generated' });
@@ -129,5 +172,5 @@ app.get('/auth-tokens', (req, res) => {
 
 app.listen(port, () => {
   console.log(`Vortex proxy running on port ${port}`);
-  startTokenRefresh();   // begin the login cycle
+  startTokenRefresh();
 });
