@@ -8,7 +8,7 @@ const EMAIL = process.env.YT_EMAIL;
 const PASSWORD = process.env.YT_PASSWORD;
 
 if (!EMAIL || !PASSWORD) {
-  console.error('Set YT_EMAIL and YT_PASSWORD environment variables');
+  console.error('YT_EMAIL and YT_PASSWORD must be set');
   process.exit(1);
 }
 
@@ -34,14 +34,14 @@ async function refreshTokens() {
     await page.type('input[type="password"]', PASSWORD);
     await page.click('#passwordNext');
 
-    // Wait for YouTube to load (we are now logged in)
+    // Wait for YouTube to load (login successful)
     await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
     // Extract all cookies
     const cookies = await page.cookies();
     const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    // Extract poToken and visitorData from YouTube's configuration
+    // Extract poToken and visitorData from YouTube’s page config
     const tokenData = await page.evaluate(() => {
       try {
         const ytcfg = window.ytcfg || {};
