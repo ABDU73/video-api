@@ -12,12 +12,11 @@ const EMAIL = process.env.YT_EMAIL;
 const PASSWORD = process.env.YT_PASSWORD;
 
 if (!EMAIL || !PASSWORD) {
-  console.error('Set YT_EMAIL and YT_PASSWORD environment variables');
+  console.error('❌ Set YT_EMAIL and YT_PASSWORD environment variables');
   process.exit(1);
 }
 
 async function refreshTokens() {
-  // Use a persistent user data directory so we stay logged in
   const browser = await puppeteer.launch({
     headless: 'new',
     args: [
@@ -29,32 +28,28 @@ async function refreshTokens() {
 
   try {
     const page = await browser.newPage();
-
-    // Go to YouTube – if we're already logged in, this will show our account
     await page.goto('https://www.youtube.com', { waitUntil: 'networkidle2' });
 
-    // Check if we need to log in
-    const needLogin = await page.evaluate(() => {
-      return !document.querySelector('button[aria-label="Account"]');
+    // Check if we are already logged in
+    const loggedIn = await page.evaluate(() => {
+      return !!document.querySelector('button[aria-label="Account"]');
     });
 
-    if (needLogin) {
-      console.log('🔐 Logging into YouTube...');
-      await page.goto('https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.youtube.com', {
-        waitUntil: 'networkidle2',
-      });
+    if (!loggedIn) {
+      console.log('🔐 Not logged in – performing login...');
+      await page.goto(
+        'https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.youtube.com',
+        { waitUntil: 'networkidle2' }
+      );
 
-      // Enter email
       await page.waitForSelector('input[type="email"]');
       await page.type('input[type="email"]', EMAIL);
       await page.click('#identifierNext');
 
-      // Enter password
       await page.waitForSelector('input[type="password"]', { visible: true });
       await page.type('input[type="password"]', PASSWORD);
       await page.click('#passwordNext');
 
-      // Wait for YouTube to load (means login successful)
       await page.waitForNavigation({ waitUntil: 'networkidle2' });
       console.log('✅ Login successful');
     } else {
@@ -65,7 +60,7 @@ async function refreshTokens() {
     const cookies = await page.cookies();
     const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    // Extract poToken and visitorData
+    // Extract poToken and visitorData (optional, but included for completeness)
     const tokenData = await page.evaluate(() => {
       try {
         const ytcfg = window.ytcfg || {};
@@ -87,7 +82,7 @@ async function refreshTokens() {
     };
 
     fs.writeFileSync(TOKENS_FILE, JSON.stringify(result, null, 2));
-    console.log('🎉 Tokens refreshed successfully');
+    console.log('🎉 Tokens saved to tokens.json');
   } catch (err) {
     console.error('Token refresh failed:', err);
   } finally {
