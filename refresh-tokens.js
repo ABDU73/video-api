@@ -16,26 +16,28 @@ if (!EMAIL || !PASSWORD) {
   process.exit(1);
 }
 
+// Replacement for removed page.waitForTimeout
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function refreshTokens() {
   const browser = await puppeteer.launch({
     headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      `--user-data-dir=${PROFILE_DIR}`,   // keep login across restarts
+      `--user-data-dir=${PROFILE_DIR}`,
     ],
   });
 
   try {
     const page = await browser.newPage();
-    // Increase default timeout (60 seconds)
     page.setDefaultNavigationTimeout(60000);
 
-    // Go to YouTube – if we're already logged in (profile exists), skip login
+    // Go to YouTube and wait 5 seconds for the page to settle
     await page.goto('https://www.youtube.com', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(3000);
+    await delay(5000);   // ✅ fixed
 
-    // Check if we see the account button
+    // Check if already logged in
     const loggedIn = await page.evaluate(() => {
       return !!document.querySelector('button[aria-label="Account"]');
     });
@@ -46,6 +48,7 @@ async function refreshTokens() {
         'https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.youtube.com',
         { waitUntil: 'domcontentloaded' }
       );
+      await delay(3000);
 
       // Enter email
       await page.waitForSelector('input[type="email"]', { timeout: 30000 });
@@ -68,7 +71,7 @@ async function refreshTokens() {
     const cookies = await page.cookies();
     const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    // Extract poToken and visitorData (optional, for future use)
+    // Extract poToken and visitorData (optional)
     const tokenData = await page.evaluate(() => {
       try {
         const ytcfg = window.ytcfg || {};
