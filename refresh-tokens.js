@@ -22,35 +22,43 @@ async function refreshTokens() {
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      `--user-data-dir=${PROFILE_DIR}`,
+      `--user-data-dir=${PROFILE_DIR}`,   // keep login across restarts
     ],
   });
 
   try {
     const page = await browser.newPage();
-    await page.goto('https://www.youtube.com', { waitUntil: 'networkidle2' });
+    // Increase default timeout (60 seconds)
+    page.setDefaultNavigationTimeout(60000);
 
-    // Check if we are already logged in
+    // Go to YouTube – if we're already logged in (profile exists), skip login
+    await page.goto('https://www.youtube.com', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(3000);
+
+    // Check if we see the account button
     const loggedIn = await page.evaluate(() => {
       return !!document.querySelector('button[aria-label="Account"]');
     });
 
     if (!loggedIn) {
-      console.log('🔐 Not logged in – performing login...');
+      console.log('🔐 Not logged in – performing login…');
       await page.goto(
         'https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.youtube.com',
-        { waitUntil: 'networkidle2' }
+        { waitUntil: 'domcontentloaded' }
       );
 
-      await page.waitForSelector('input[type="email"]');
+      // Enter email
+      await page.waitForSelector('input[type="email"]', { timeout: 30000 });
       await page.type('input[type="email"]', EMAIL);
       await page.click('#identifierNext');
 
-      await page.waitForSelector('input[type="password"]', { visible: true });
+      // Enter password
+      await page.waitForSelector('input[type="password"]', { visible: true, timeout: 30000 });
       await page.type('input[type="password"]', PASSWORD);
       await page.click('#passwordNext');
 
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      // Wait for YouTube to load after login
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
       console.log('✅ Login successful');
     } else {
       console.log('🔓 Already logged in (profile reused)');
@@ -60,7 +68,7 @@ async function refreshTokens() {
     const cookies = await page.cookies();
     const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    // Extract poToken and visitorData (optional, but included for completeness)
+    // Extract poToken and visitorData (optional, for future use)
     const tokenData = await page.evaluate(() => {
       try {
         const ytcfg = window.ytcfg || {};
@@ -82,7 +90,7 @@ async function refreshTokens() {
     };
 
     fs.writeFileSync(TOKENS_FILE, JSON.stringify(result, null, 2));
-    console.log('🎉 Tokens saved to tokens.json');
+    console.log('🎉 Cookies saved to tokens.json');
   } catch (err) {
     console.error('Token refresh failed:', err);
   } finally {
