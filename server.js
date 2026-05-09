@@ -14,7 +14,7 @@ async function startTokenRefresh() {
   try {
     await refreshTokens();
   } catch (e) {
-    console.error('Auto‑login failed, falling back to manual YOUTUBE_COOKIES variable if set.');
+    console.error('Auto‑login failed, using manual YOUTUBE_COOKIES if set.');
   }
   // Refresh every 2 hours
   setInterval(async () => {
@@ -168,7 +168,6 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// Optional auth‑tokens endpoint (returns cookies for Flutter, if needed)
 app.get('/auth-tokens', (req, res) => {
   if (fs.existsSync(TOKENS_FILE)) {
     const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
