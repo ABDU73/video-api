@@ -6,22 +6,6 @@ const path = require('path');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ---------- Auto‑login ----------
-const TOKENS_FILE = path.join(__dirname, 'tokens.json');
-const { refreshTokens } = require('./refresh-tokens');
-
-async function startTokenRefresh() {
-  try {
-    await refreshTokens();
-  } catch (e) {
-    console.error('Auto‑login failed, using manual YOUTUBE_COOKIES if set.');
-  }
-  // Refresh every 2 hours
-  setInterval(async () => {
-    try { await refreshTokens(); } catch (_) {}
-  }, 2 * 60 * 60 * 1000);
-}
-
 // ---------- yt-dlp extraction ----------
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -59,21 +43,15 @@ function getRandomUserAgent() {
 
 async function extract(url) {
   const ua = getRandomUserAgent();
+  const cookiesEnv = process.env.YOUTUBE_COOKIES || '';
 
-  // 1. Try tokens.json (auto‑login)
+  // Write cookies to a temporary file
   let cookieFile = '';
-  if (fs.existsSync(TOKENS_FILE)) {
-    const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-    if (tokens.cookies) {
-      cookieFile = path.join(__dirname, 'yt-cookies.txt');
-      fs.writeFileSync(cookieFile, tokens.cookies);
-    }
-  }
-
-  // 2. Fallback to YOUTUBE_COOKIES environment variable (manual)
-  if (!cookieFile && process.env.YOUTUBE_COOKIES) {
+  if (cookiesEnv) {
     cookieFile = path.join(__dirname, 'yt-cookies.txt');
-    fs.writeFileSync(cookieFile, process.env.YOUTUBE_COOKIES);
+    fs.writeFileSync(cookieFile, cookiesEnv);
+  } else {
+    console.error('❌ YOUTUBE_COOKIES environment variable not set – extraction will fail.');
   }
 
   const cookieArgs = cookieFile ? `--cookies "${cookieFile}"` : '';
@@ -111,8 +89,10 @@ app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size 
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
+
   const cached = getFromCache(url);
   if (cached) return res.json({ url: cached });
+
   try {
     const result = await withRateLimit(url, () => extract(url));
     if (result) {
@@ -126,6 +106,7 @@ app.get('/get', async (req, res) => {
   }
 });
 
+// Search endpoint (unchanged)
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
@@ -168,15 +149,4 @@ app.get('/search', async (req, res) => {
   }
 });
 
-app.get('/auth-tokens', (req, res) => {
-  if (fs.existsSync(TOKENS_FILE)) {
-    const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-    return res.json(tokens);
-  }
-  res.json({ cookies: process.env.YOUTUBE_COOKIES || '' });
-});
-
-app.listen(port, () => {
-  console.log(`Vortex proxy running on port ${port}`);
-  startTokenRefresh();
-});
+app.listen(port, () => console.log(`Vortex proxy running on port ${port}`));
