@@ -6,13 +6,20 @@ const path = require('path');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ---------- Auth Tokens ----------
+// ---------- Auto‑login ----------
 const TOKENS_FILE = path.join(__dirname, 'tokens.json');
 const { refreshTokens } = require('./refresh-tokens');
 
 async function startTokenRefresh() {
-  await refreshTokens();   // login now with Puppeteer
-  setInterval(refreshTokens, 2 * 60 * 60 * 1000); // keep alive
+  try {
+    await refreshTokens();
+  } catch (e) {
+    console.error('Auto‑login failed, falling back to manual YOUTUBE_COOKIES variable if set.');
+  }
+  // Refresh every 2 hours
+  setInterval(async () => {
+    try { await refreshTokens(); } catch (_) {}
+  }, 2 * 60 * 60 * 1000);
 }
 
 // ---------- yt-dlp extraction ----------
@@ -53,7 +60,7 @@ function getRandomUserAgent() {
 async function extract(url) {
   const ua = getRandomUserAgent();
 
-  // Load cookies from tokens.json (created by refresh-tokens.js)
+  // 1. Try tokens.json (auto‑login)
   let cookieFile = '';
   if (fs.existsSync(TOKENS_FILE)) {
     const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
@@ -61,6 +68,12 @@ async function extract(url) {
       cookieFile = path.join(__dirname, 'yt-cookies.txt');
       fs.writeFileSync(cookieFile, tokens.cookies);
     }
+  }
+
+  // 2. Fallback to YOUTUBE_COOKIES environment variable (manual)
+  if (!cookieFile && process.env.YOUTUBE_COOKIES) {
+    cookieFile = path.join(__dirname, 'yt-cookies.txt');
+    fs.writeFileSync(cookieFile, process.env.YOUTUBE_COOKIES);
   }
 
   const cookieArgs = cookieFile ? `--cookies "${cookieFile}"` : '';
@@ -98,10 +111,8 @@ app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size 
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
-
   const cached = getFromCache(url);
   if (cached) return res.json({ url: cached });
-
   try {
     const result = await withRateLimit(url, () => extract(url));
     if (result) {
@@ -115,7 +126,6 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// ✅ Search endpoint (unchanged)
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
@@ -158,16 +168,16 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// Auth tokens endpoint (returns cookies for Flutter, optional)
+// Optional auth‑tokens endpoint (returns cookies for Flutter, if needed)
 app.get('/auth-tokens', (req, res) => {
-  if (!fs.existsSync(TOKENS_FILE)) {
-    return res.status(503).json({ error: 'Tokens not yet generated' });
+  if (fs.existsSync(TOKENS_FILE)) {
+    const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
+    return res.json(tokens);
   }
-  const tokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-  res.json(tokens);
+  res.json({ cookies: process.env.YOUTUBE_COOKIES || '' });
 });
 
 app.listen(port, () => {
   console.log(`Vortex proxy running on port ${port}`);
-  startTokenRefresh();   // begin automatic login with Puppeteer
+  startTokenRefresh();
 });
