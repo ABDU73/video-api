@@ -1,112 +1,91 @@
-const express = require('express');
-const axios = require('axios');
-const { exec } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const NodeCache = require('node-cache');
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
-const app = express();
-const port = process.env.PORT || 3000;
+class VideoService {
+  final YoutubeExplode _yt = YoutubeExplode();
 
-// -------- Persistent cache (file-based, survives Render restarts) ----------
-const CACHE_FILE = path.join(__dirname, 'url_cache.json');
-const cache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
+  // Your Render server (already optimised)
+  static const String _serverBase = 'https://video-api-hqct.onrender.com';
 
-try {
-  if (fs.existsSync(CACHE_FILE)) {
-    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    cache.mget(Object.keys(data));
+  // ------------------------------------------------------------
+  // 1) SEARCH (on‑device, no API key, no server)
+  // ------------------------------------------------------------
+  Future<Map<String, dynamic>> search(String query,
+      {String? pageToken}) async {
+    try {
+      final searchResults = await _yt.search.search(
+        query,
+        filter: TypeFilters.video,
+        pageToken: pageToken,
+      );
+      final videos = searchResults.items.map((video) {
+        return {
+          'videoId': video.id.value,
+          'title': video.title,
+          'author': video.author,
+          'thumbnail': video.thumbnails.highResUrl ??
+              video.thumbnails.mediumResUrl ??
+              video.thumbnails.lowResUrl,
+          'duration': video.duration?.toString() ?? 'Unknown',
+        };
+      }).toList();
+      return {
+        'videos': videos,
+        'nextPageToken': searchResults.nextPageToken,
+      };
+    } catch (e) {
+      return {'videos': [], 'nextPageToken': null};
+    }
   }
-} catch (_) {}
 
-setInterval(() => {
-  const all = cache.mget(cache.keys());
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(all));
-}, 300000);
-
-// -------- Rate limiting ----------
-const activeRequests = new Set();
-const MAX_CONCURRENT = 3;
-async function withLimit(url, fn) {
-  while (activeRequests.size >= MAX_CONCURRENT) {
-    await new Promise(resolve => setTimeout(resolve, 200));
+  // ------------------------------------------------------------
+  // 2) DOWNLOAD URL + METADATA (fast Render server)
+  // ------------------------------------------------------------
+  Future<Map<String, dynamic>?> getVideoInfo(String youtubeUrl) async {
+    try {
+      final uri = Uri.parse(
+        '$_serverBase/get?url=${Uri.encodeComponent(youtubeUrl)}',
+      );
+      final response = await http.get(uri)
+          .timeout(const Duration(seconds: 8));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final directUrl = data['url'] as String?;
+        if (directUrl != null && directUrl.isNotEmpty) {
+          // Fetch metadata from youtube_explode_dart (lightweight)
+          final videoId = _extractVideoId(youtubeUrl);
+          if (videoId != null) {
+            final video = await _yt.videos.get(VideoId(videoId));
+            return {
+              'title': video.title,
+              'author': video.author,
+              'thumbnail': video.thumbnails.highResUrl ??
+                  video.thumbnails.mediumResUrl ??
+                  video.thumbnails.lowResUrl,
+              'duration': video.duration?.toString() ?? 'Unknown',
+              'downloadUrl': directUrl,
+            };
+          }
+          return {'downloadUrl': directUrl};
+        }
+      }
+    } catch (_) {}
+    return null;
   }
-  activeRequests.add(url);
-  try { return await fn(); } finally { activeRequests.delete(url); }
-}
 
-// -------- Extract YouTube video ID ----------
-function getYouTubeId(url) {
-  const match = url.match(/(?:youtube\.com\/.*[?&]v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-  return match ? match[1] : null;
-}
-
-// ======== Primary: Invidious (instant) ========
-async function extractInvidious(videoId) {
-  const api = `https://inv.nadeko.net/latest_version?id=${videoId}&itag=18`;
-  const { data } = await axios.get(api, { timeout: 5000 });
-  if (data && data.startsWith('http')) return data;
-  throw new Error('Invalid Invidious response');
-}
-
-// ======== Fallback: yt-dlp (fast format 18) ========
-async function extractYtDlp(url) {
-  const cookieFile = '/tmp/yt-cookies.txt';
-  const cookies = process.env.YOUTUBE_COOKIES || '';
-  if (!cookies) throw new Error('YOUTUBE_COOKIES not set');
-
-  fs.writeFileSync(cookieFile, cookies);
-
-  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-  const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -f 18 --no-playlist --socket-timeout 10 -g "${url}"`;
-
-  return new Promise((resolve, reject) => {
-    exec(cmd, { timeout: 10000 }, (error, stdout, stderr) => {
-      try { fs.unlinkSync(cookieFile); } catch (_) {}
-      if (error) return reject(new Error(stderr || error.message));
-      const directUrl = stdout.trim();
-      if (directUrl && directUrl.startsWith('http')) resolve(directUrl);
-      else reject(new Error('No direct URL'));
-    });
-  });
-}
-
-// ======== Main extraction logic ========
-async function getDirectUrl(youtubeUrl) {
-  const videoId = getYouTubeId(youtubeUrl);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-
-  // 1. Try Invidious first (instant)
-  try { return await extractInvidious(videoId); } catch (_) {}
-
-  // 2. Fallback to yt-dlp
-  return await extractYtDlp(youtubeUrl);
-}
-
-// ======== Endpoints ========
-app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.stats.keys }));
-
-app.get('/get', async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'Missing url' });
-
-  const cached = cache.get(url);
-  if (cached) return res.json({ url: cached });
-
-  try {
-    const direct = await withLimit(url, () => getDirectUrl(url));
-    cache.set(url, direct);
-    return res.json({ url: direct });
-  } catch (e) {
-    console.error('Extraction failed:', e.message);
-    return res.status(500).json({ error: 'Extraction failed' });
+  /// Quick helper – just returns the download URL
+  Future<String?> getDirectUrl(String youtubeUrl) async {
+    final info = await getVideoInfo(youtubeUrl);
+    return info?['downloadUrl']?.toString();
   }
-});
 
-// Search (unchanged)
-app.get('/search', async (req, res) => {
-  // ... your existing search code ...
-});
+  String? _extractVideoId(String url) {
+    final match = RegExp(
+      r'(?:youtube\.com\/.*[?&]v=|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+    ).firstMatch(url);
+    return match?.group(1);
+  }
 
-app.listen(port, () => console.log(`Vortex proxy running on port ${port}`));
+  void dispose() => _yt.close();
+}
