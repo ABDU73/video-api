@@ -2,21 +2,33 @@ name: Refresh YouTube Cookies
 
 on:
   schedule:
-    - cron: '0 */3 * * *'   # every 3 hours
-  workflow_dispatch:          # allows manual trigger
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-      - name: Install dependencies
+
+      # 1. Install Chromium + dependencies
+      - name: Install Chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+
+      # 2. Install Node dependencies
+      - name: Install npm packages
         run: npm install puppeteer-extra puppeteer-extra-plugin-stealth
+
+      # 3. Run the refresh script
       - name: Run refresh script
         env:
+          PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium-browser
           YT_EMAIL: ${{ secrets.YT_EMAIL }}
           YT_PASSWORD: ${{ secrets.YT_PASSWORD }}
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
