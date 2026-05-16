@@ -1,174 +1,150 @@
-import 'dart:convert';
-import 'package:http/http.dart' as http;
-import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+const express = require('express');
+const axios = require('axios');
+const { exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
-class VideoService {
-  final YoutubeExplode _yt = YoutubeExplode();
-  YoutubeExplode get yt => _yt;
+const app = express();
+const port = process.env.PORT || 3000;
 
-  static const String _serverBase = 'https://video-api-hqct.onrender.com';
+// ====================== CACHE ======================
+const CACHE_FILE = path.join(__dirname, 'url_cache.json');
+const cache = new Map();
 
-  // ------------------------------------------------------------
-  // 1) SEARCH
-  // ------------------------------------------------------------
-  Future<VideoSearchList> searchFirstPage(String query) async {
-    return await _yt.search.search(query, filter: TypeFilters.video);
-  }
-
-  // ------------------------------------------------------------
-  // 2) PLAYBACK URL (server first, 720p)
-  // ------------------------------------------------------------
-  Future<String?> getPlayUrl(String youtubeUrl) async {
-    final uri = Uri.parse('$_serverBase/play?url=${Uri.encodeComponent(youtubeUrl)}');
-    try {
-      final response = await http.get(uri).timeout(const Duration(seconds: 10));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final url = data['url'] as String?;
-        if (url != null && url.isNotEmpty) return url;
-      }
-    } catch (_) {}
-
-    // fallback on‑device
-    try {
-      final videoId = _extractVideoId(youtubeUrl);
-      if (videoId == null) return null;
-      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final stream = manifest.muxed.withHighestBitrate();
-      return stream?.url.toString();
-    } catch (_) {}
-    return null;
-  }
-
-  // ------------------------------------------------------------
-  // 3) QUICK DOWNLOAD (server 480p, with size check)
-  // ------------------------------------------------------------
-  Future<String?> getDirectUrl(String youtubeUrl) async {
-    // Try server default (480p)
-    final uri = Uri.parse('$_serverBase/get?url=${Uri.encodeComponent(youtubeUrl)}');
-    try {
-      final response = await http.get(uri).timeout(const Duration(seconds: 10));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final url = data['url'] as String?;
-        if (url != null && url.isNotEmpty) {
-          // Verify size (skip tiny files)
-          final headResp = await http.head(Uri.parse(url))
-              .timeout(const Duration(seconds: 5));
-          final contentLength = int.tryParse(headResp.headers['content-length'] ?? '');
-          if (contentLength != null && contentLength > 2 * 1024 * 1024) {
-            return url;
-          }
-        }
-      }
-    } catch (_) {}
-
-    // Fallback on‑device 480p
-    try {
-      final videoId = _extractVideoId(youtubeUrl);
-      if (videoId == null) return null;
-      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final stream = manifest.muxed
-          .where((s) => (s.videoResolution?.height ?? 0) <= 480)
-          .withHighestBitrate();
-      final selected = stream ?? manifest.muxed.withHighestBitrate();
-      return selected?.url.toString();
-    } catch (_) {}
-    return null;
-  }
-
-  // ------------------------------------------------------------
-  // 4) AVAILABLE QUALITIES (on‑device, instant)
-  // ------------------------------------------------------------
-  Future<List<Map<String, dynamic>>> getAvailableQualities(String youtubeUrl) async {
-    final videoId = _extractVideoId(youtubeUrl);
-    if (videoId == null) return [];
-
-    try {
-      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final streams = manifest.muxed.toList();
-
-      final seen = <int>{};
-      final qualities = <Map<String, dynamic>>[];
-
-      for (final s in streams) {
-        final height = s.videoResolution?.height ?? 0;
-        if (height == 0 || seen.contains(height)) continue;
-        seen.add(height);
-
-        qualities.add({
-          'height': height,
-          'label': '${height}p',
-          'url': s.url.toString(),
-          'size': s.size.totalBytes,
-        });
-      }
-
-      qualities.sort((a, b) => (b['height'] as int).compareTo(a['height']));
-      return qualities;
-    } catch (_) {
-      return [];
+try {
+  if (fs.existsSync(CACHE_FILE)) {
+    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+    const entries = JSON.parse(raw);
+    for (const [key, value] of Object.entries(entries)) {
+      cache.set(key, value);
     }
   }
+} catch (_) {}
 
-  // ------------------------------------------------------------
-  // 5) DOWNLOAD SPECIFIC QUALITY VIA SERVER (with caching)
-  // ------------------------------------------------------------
-  Future<String?> getServerDirectUrlForQuality(String youtubeUrl, int height) async {
-    final uri = Uri.parse('$_serverBase/get?url=${Uri.encodeComponent(youtubeUrl)}&q=$height');
-    try {
-      final response = await http.get(uri).timeout(const Duration(seconds: 10));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final url = data['url'] as String?;
-        if (url != null && url.isNotEmpty) return url;
-      }
-    } catch (_) {}
-    // Fallback to on‑device extraction for that height
-    try {
-      final videoId = _extractVideoId(youtubeUrl);
-      if (videoId == null) return null;
-      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final stream = manifest.muxed
-          .where((s) => (s.videoResolution?.height ?? 0) == height)
-          .withHighestBitrate();
-      return stream?.url.toString();
-    } catch (_) {}
-    return null;
-  }
-
-  // ------------------------------------------------------------
-  // 6) FULL VIDEO INFO (metadata + quick download URL)
-  // ------------------------------------------------------------
-  Future<Map<String, dynamic>?> getVideoInfo(String youtubeUrl) async {
-    try {
-      final videoId = _extractVideoId(youtubeUrl);
-      if (videoId == null) return null;
-
-      final video = await _yt.videos.get(VideoId(videoId));
-      final downloadUrl = await getDirectUrl(youtubeUrl);
-
-      return {
-        'videoId': video.id.value,
-        'title': video.title,
-        'author': video.author,
-        'thumbnail': video.thumbnails.highResUrl ??
-            video.thumbnails.mediumResUrl ??
-            video.thumbnails.lowResUrl,
-        'duration': video.duration?.toString() ?? 'Unknown',
-        'downloadUrl': downloadUrl,
-      };
-    } catch (_) {
-      return null;
-    }
-  }
-
-  String? _extractVideoId(String url) {
-    final match = RegExp(
-      r'(?:youtube\.com\/.*[?&]v=|youtu\.be\/)([a-zA-Z0-9_-]{11})',
-    ).firstMatch(url);
-    return match?.group(1);
-  }
-
-  void dispose() => _yt.close();
+function saveCache() {
+  try {
+    const obj = Object.fromEntries(cache);
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(obj));
+  } catch (_) {}
 }
+setInterval(saveCache, 300000);
+process.on('SIGINT', () => { saveCache(); process.exit(0); });
+process.on('SIGTERM', () => { saveCache(); process.exit(0); });
+
+// ====================== RATE LIMITER ======================
+const activeRequests = new Set();
+const MAX_CONCURRENT = 3;
+async function withLimit(url, fn) {
+  while (activeRequests.size >= MAX_CONCURRENT) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  activeRequests.add(url);
+  try { return await fn(); } finally { activeRequests.delete(url); }
+}
+
+// ====================== HELPERS ======================
+function getYouTubeId(url) {
+  const match = url.match(/(?:youtube\.com\/.*[?&]v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  return match ? match[1] : null;
+}
+
+// ====================== EXTRACTION ======================
+async function extractYtDlp(url, format = '18') {
+  const cookieFile = '/tmp/yt-cookies.txt';
+  const cookiesRaw = process.env.YOUTUBE_COOKIES || '';
+
+  if (!cookiesRaw) throw new Error('YOUTUBE_COOKIES not set');
+
+  let cookies;
+  if (cookiesRaw.startsWith('# Netscape')) {
+    cookies = cookiesRaw;
+  } else {
+    cookies = Buffer.from(cookiesRaw, 'base64').toString('utf8');
+  }
+
+  fs.writeFileSync(cookieFile, cookies);
+
+  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+  const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -f ${format} --no-playlist --socket-timeout 10 -g "${url}"`;
+
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: 15000 }, (error, stdout, stderr) => {
+      try { fs.unlinkSync(cookieFile); } catch (_) {}
+      if (error) return reject(new Error(stderr || error.message));
+      const directUrl = stdout.trim();
+      if (directUrl && directUrl.startsWith('http')) resolve(directUrl);
+      else reject(new Error('No direct URL'));
+    });
+  });
+}
+
+// ====================== GET STREAM URL ======================
+async function getStreamUrl(youtubeUrl, quality = 'download', targetHeight = null) {
+  const videoId = getYouTubeId(youtubeUrl);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+
+  let format;
+  if (quality === 'play') {
+    format = 'best[height<=720]';                     // streaming
+  } else if (targetHeight) {
+    // /get?q=360  →  best[height<=360][ext=mp4]
+    format = `best[height<=${targetHeight}][ext=mp4]`;
+  } else {
+    // default download = 480p
+    format = 'best[height<=480][ext=mp4]';
+  }
+
+  return await extractYtDlp(youtubeUrl, format);
+}
+
+// ====================== ENDPOINTS ======================
+
+// Health check
+app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size }));
+
+// Download endpoint – now accepts optional `q` (quality height)
+app.get('/get', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  const targetHeight = req.query.q ? parseInt(req.query.q, 10) : null;
+  const cacheKey = targetHeight ? `${url}::${targetHeight}` : url;
+
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json({ url: cached });
+
+  try {
+    const direct = await withLimit(cacheKey, () => getStreamUrl(url, 'download', targetHeight));
+    cache.set(cacheKey, direct);
+    return res.json({ url: direct });
+  } catch (e) {
+    console.error('Download extraction failed:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Playback endpoint (best ≤720p, cached separately)
+app.get('/play', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  const cacheKey = `play:${url}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json({ url: cached });
+
+  try {
+    const direct = await withLimit(cacheKey, () => getStreamUrl(url, 'play'));
+    cache.set(cacheKey, direct);
+    return res.json({ url: direct });
+  } catch (e) {
+    console.error('Playback extraction failed:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Optional search (requires YOUTUBE_API_KEY)
+app.get('/search', async (req, res) => {
+  // ... (unchanged, can be removed if not used)
+});
+
+app.listen(port, () => console.log(`Vortex proxy running on port ${port}`));
