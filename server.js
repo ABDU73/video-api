@@ -81,11 +81,22 @@ async function extractYtDlp(url, format = '18') {
   });
 }
 
-async function getStreamUrl(youtubeUrl, quality = 'download') {
+// ====================== GET STREAM URL ======================
+async function getStreamUrl(youtubeUrl, quality = 'download', targetHeight = null) {
   const videoId = getYouTubeId(youtubeUrl);
   if (!videoId) throw new Error('Invalid YouTube URL');
 
-  const format = quality === 'play' ? 'best[height<=720]' : '18';
+  let format;
+  if (quality === 'play') {
+    format = 'best[height<=720]';                     // streaming
+  } else if (targetHeight) {
+    // /get?q=360  →  best[height<=360][ext=mp4]
+    format = `best[height<=${targetHeight}][ext=mp4]`;
+  } else {
+    // default download = 480p
+    format = 'best[height<=480][ext=mp4]';
+  }
+
   return await extractYtDlp(youtubeUrl, format);
 }
 
@@ -94,17 +105,20 @@ async function getStreamUrl(youtubeUrl, quality = 'download') {
 // Health check
 app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size }));
 
-// Download endpoint (format 18 – small, fast)
+// Download endpoint – now accepts optional `q` (quality height)
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url' });
 
-  const cached = cache.get(url);
+  const targetHeight = req.query.q ? parseInt(req.query.q, 10) : null;
+  const cacheKey = targetHeight ? `${url}::${targetHeight}` : url;
+
+  const cached = cache.get(cacheKey);
   if (cached) return res.json({ url: cached });
 
   try {
-    const direct = await withLimit(url, () => getStreamUrl(url, 'download'));
-    cache.set(url, direct);
+    const direct = await withLimit(cacheKey, () => getStreamUrl(url, 'download', targetHeight));
+    cache.set(cacheKey, direct);
     return res.json({ url: direct });
   } catch (e) {
     console.error('Download extraction failed:', e.message);
@@ -122,7 +136,7 @@ app.get('/play', async (req, res) => {
   if (cached) return res.json({ url: cached });
 
   try {
-    const direct = await withLimit(url, () => getStreamUrl(url, 'play'));
+    const direct = await withLimit(cacheKey, () => getStreamUrl(url, 'play'));
     cache.set(cacheKey, direct);
     return res.json({ url: direct });
   } catch (e) {
