@@ -1,0 +1,24 @@
+name: Refresh YouTube Cookies
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'   # every 3 hours
+  workflow_dispatch:          # allows manual trigger
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install dependencies
+        run: npm install puppeteer-extra puppeteer-extra-plugin-stealth
+      - name: Run refresh script
+        env:
+          YT_EMAIL: ${{ secrets.YT_EMAIL }}
+          YT_PASSWORD: ${{ secrets.YT_PASSWORD }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: node cron-refresh-cookies.js
