@@ -52,14 +52,12 @@ async function refreshAndUpdate() {
       // Navigate to Google sign‑in
       await page.goto('https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.youtube.com&hl=en&flowName=GlifWebSignIn&flowEntry=ServiceLogin', { waitUntil: 'networkidle2' });
 
-      // Try multiple selectors for the email field
+      // Wait for email field
       const emailSelectors = [
         'input[type="email"]',
         'input[name="identifier"]',
         'input[id="identifierId"]',
-        'input[aria-label="Email or phone"]',
       ];
-
       let emailInput = null;
       for (const sel of emailSelectors) {
         try {
@@ -67,39 +65,58 @@ async function refreshAndUpdate() {
           if (emailInput) break;
         } catch (_) {}
       }
-
-      if (!emailInput) {
-        console.error('Could not find email input field');
-        throw new Error('Email field not found');
-      }
+      if (!emailInput) throw new Error('Email field not found');
 
       await emailInput.type(EMAIL, { delay: 50 });
-      await page.click('#identifierNext');
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
-      // Wait for password field
+      // Click "Next" – try multiple selectors + press Enter as fallback
+      const nextBtnSelectors = ['#identifierNext', 'button[jsname="LgbsSe"]', 'div[role="button"]#identifierNext'];
+      let clicked = false;
+      for (const sel of nextBtnSelectors) {
+        try {
+          await page.waitForSelector(sel, { timeout: 5000 });
+          await page.click(sel);
+          clicked = true;
+          break;
+        } catch (_) {}
+      }
+      if (!clicked) await page.keyboard.press('Enter');
+
+      // Wait for password page to load – give it enough time
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+
+      // Now wait for password field
       const passwordSelectors = [
         'input[type="password"]',
         'input[name="Passwd"]',
         'input[aria-label="Enter your password"]',
       ];
-
       let passwordInput = null;
       for (const sel of passwordSelectors) {
         try {
-          passwordInput = await page.waitForSelector(sel, { timeout: 8000 });
+          passwordInput = await page.waitForSelector(sel, { timeout: 10000 });
           if (passwordInput) break;
         } catch (_) {}
       }
-
-      if (!passwordInput) {
-        console.error('Could not find password input field');
-        throw new Error('Password field not found');
-      }
+      if (!passwordInput) throw new Error('Password field not found');
 
       await passwordInput.type(PASSWORD, { delay: 50 });
-      await page.click('#passwordNext');
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+
+      // Click "Next" for password
+      const passwordNextSelectors = ['#passwordNext', 'button[jsname="LgbsSe"]', 'div[role="button"]#passwordNext'];
+      let pwClicked = false;
+      for (const sel of passwordNextSelectors) {
+        try {
+          await page.waitForSelector(sel, { timeout: 5000 });
+          await page.click(sel);
+          pwClicked = true;
+          break;
+        } catch (_) {}
+      }
+      if (!pwClicked) await page.keyboard.press('Enter');
+
+      // Wait for YouTube to load after login
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
 
       console.log('Login successful');
     } else {
