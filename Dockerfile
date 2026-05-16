@@ -1,20 +1,17 @@
-# Dockerfile.cron
 FROM node:18-slim
 
-# Install Chromium + dependencies for Puppeteer
+# Install Python, ffmpeg, curl (needed by yt-dlp)
 RUN apt-get update && \
-    apt-get install -y chromium libnss3 libnspr4 libatk-bridge2.0-0 libdrm2 \
-    libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-    libasound2 libpangocairo-1.0-0 libpango-1.0-0 libcups2 libatspi2.0-0 && \
+    apt-get install -y python3 ffmpeg curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Tell Puppeteer where Chromium lives
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# Download yt-dlp
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
-COPY package.json .
+COPY . .
+
 RUN npm install
 
-COPY cron-refresh-cookies.js .
-
-CMD ["node", "cron-refresh-cookies.js"]
+EXPOSE 3000
+CMD ["node", "server.js"]
