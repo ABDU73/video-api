@@ -38,6 +38,8 @@ async function withLimit(url, fn) {
   while (activeRequests.size >= MAX_CONCURRENT) {
     await new Promise(resolve => setTimeout(resolve, 200));
   }
+  // Small extra delay to avoid hammering YouTube
+  await new Promise(resolve => setTimeout(resolve, 500));
   activeRequests.add(url);
   try { return await fn(); } finally { activeRequests.delete(url); }
 }
@@ -64,10 +66,30 @@ function writeCookieFile() {
 }
 
 // ====================== EXTRACTION ======================
-async function extractYtDlp(url, format = '18') {
+
+// First try yt-dlp, then Invidious as fallback
+async function extractDirectUrl(youtubeUrl, format = 'best[height<=480][ext=mp4]') {
+  const videoId = getYouTubeId(youtubeUrl);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+
+  // 1. yt-dlp
+  try {
+    return await ytDlp(youtubeUrl, format);
+  } catch (e) {
+    // If yt-dlp fails (e.g., auth required), try Invidious
+    try {
+      return await invidious(videoId, format);
+    } catch (e2) {
+      throw new Error(`Both yt-dlp and Invidious failed: ${e.message} / ${e2.message}`);
+    }
+  }
+}
+
+async function ytDlp(url, format) {
   const cookieFile = writeCookieFile();
   const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-  const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -f ${format} --no-playlist --socket-timeout 10 -g "${url}"`;
+  // Quoting the format prevents shell interpretation of brackets
+  const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -f '${format}' --no-playlist --socket-timeout 10 -g "${url}"`;
 
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout: 15000 }, (error, stdout, stderr) => {
@@ -80,41 +102,48 @@ async function extractYtDlp(url, format = '18') {
   });
 }
 
-// ====================== GET STREAM URL ======================
-async function getStreamUrl(youtubeUrl, quality = 'download', targetHeight = null) {
-  const videoId = getYouTubeId(youtubeUrl);
-  if (!videoId) throw new Error('Invalid YouTube URL');
+// Invidious fallback (public instance, no cookies needed)
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://vid.puffyan.us',
+  'https://invidious.snopyta.org',
+  'https://yewtu.be',
+];
 
-  let format;
-  if (quality === 'play') {
-    format = 'best[height<=720]';
-  } else if (targetHeight) {
-    format = `best[height<=${targetHeight}][ext=mp4]`;
-  } else {
-    format = 'best[height<=480][ext=mp4]';
+async function invidious(videoId, format) {
+  // Invidious only returns direct URLs for format 18 or 22; map our format to a simple itag
+  let itag = 18; // default 360p
+  if (format.includes('480')) itag = 18;  // Invidious doesn't have a 480p direct mp4
+  if (format.includes('720')) itag = 22;  // 720p mp4
+  if (format.includes('1080')) itag = 37; // 1080p mp4 (rare)
+
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const api = `${base}/latest_version?id=${videoId}&itag=${itag}`;
+      const { data } = await axios.get(api, { timeout: 5000 });
+      if (data && data.startsWith('http')) return data;
+    } catch (_) {}
   }
-
-  return await extractYtDlp(youtubeUrl, format);
+  throw new Error('All Invidious instances failed');
 }
 
 // ====================== ENDPOINTS ======================
 
-// Health check
 app.get('/status', (req, res) => res.json({ status: 'ok', cacheSize: cache.size }));
 
-// Download endpoint – now accepts optional `q` (quality height)
 app.get('/get', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url' });
 
   const targetHeight = req.query.q ? parseInt(req.query.q, 10) : null;
-  const cacheKey = targetHeight ? `${url}::${targetHeight}` : url;
+  const format = targetHeight ? `best[height<=${targetHeight}][ext=mp4]` : 'best[height<=480][ext=mp4]';
+  const cacheKey = `get:${format}:${url}`;
 
   const cached = cache.get(cacheKey);
   if (cached) return res.json({ url: cached });
 
   try {
-    const direct = await withLimit(cacheKey, () => getStreamUrl(url, 'download', targetHeight));
+    const direct = await withLimit(cacheKey, () => extractDirectUrl(url, format));
     cache.set(cacheKey, direct);
     return res.json({ url: direct });
   } catch (e) {
@@ -123,17 +152,18 @@ app.get('/get', async (req, res) => {
   }
 });
 
-// Playback endpoint (best ≤720p, cached separately)
 app.get('/play', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url' });
 
+  const format = 'best[height<=720]';
   const cacheKey = `play:${url}`;
+
   const cached = cache.get(cacheKey);
   if (cached) return res.json({ url: cached });
 
   try {
-    const direct = await withLimit(cacheKey, () => getStreamUrl(url, 'play'));
+    const direct = await withLimit(cacheKey, () => extractDirectUrl(url, format));
     cache.set(cacheKey, direct);
     return res.json({ url: direct });
   } catch (e) {
@@ -142,9 +172,6 @@ app.get('/play', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────
-// FIXED: Formats endpoint – returns ALL available video qualities
-// ──────────────────────────────────────────────
 app.get('/formats', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url' });
@@ -154,9 +181,9 @@ app.get('/formats', async (req, res) => {
   if (cached) return res.json(cached);
 
   try {
+    // Use yt-dlp -J to get full JSON
     const cookieFile = writeCookieFile();
     const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-    // Use JSON output – much easier to parse and returns ALL formats
     const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -J "${url}"`;
 
     const stdout = await new Promise((resolve, reject) => {
@@ -169,44 +196,35 @@ app.get('/formats', async (req, res) => {
 
     const videoInfo = JSON.parse(stdout);
     const formats = videoInfo.formats || [];
-
     const seen = new Set();
     const qualities = [];
 
     for (const f of formats) {
-      // Only consider formats that have a video stream (height > 0)
       if (!f.height || f.height === 0) continue;
       const height = f.height;
       if (seen.has(height)) continue;
       seen.add(height);
 
-      // Try to get a file size (approximate if missing)
       let size = f.filesize || f.filesize_approx || 0;
       if (!size && f.tbr) {
-        // tbr = total bitrate in kbps; assume 1 minute video for rough estimate
-        size = (f.tbr * 1000 / 8) * 60; // rough bytes for 1 minute
+        size = (f.tbr * 1000 / 8) * 60;
       }
-      // Fallback size based on height
       if (!size) size = height * 2000;
 
-      qualities.push({
-        height,
-        label: `${height}p`,
-        size: Math.round(size),
-      });
+      qualities.push({ height, label: `${height}p`, size: Math.round(size) });
     }
 
-    // Sort from highest to lowest
     qualities.sort((a, b) => b.height - a.height);
     cache.set(cacheKey, qualities);
     res.json(qualities);
   } catch (e) {
     console.error('Formats extraction failed:', e.message);
-    res.status(500).json({ error: e.message });
+    // Return an empty array – the Flutter app will show a fallback dialog
+    res.json([]);
   }
 });
 
-// Optional search (requires YOUTUBE_API_KEY)
+// Optional search
 app.get('/search', async (req, res) => {
   const { q, pageToken } = req.query;
   if (!q) return res.status(400).json({ error: 'q required' });
