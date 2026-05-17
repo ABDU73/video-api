@@ -143,7 +143,7 @@ app.get('/play', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
-// FORMATS endpoint – returns all available video qualities
+// FIXED: Formats endpoint – returns ALL available video qualities
 // ──────────────────────────────────────────────
 app.get('/formats', async (req, res) => {
   const url = req.query.url;
@@ -156,51 +156,50 @@ app.get('/formats', async (req, res) => {
   try {
     const cookieFile = writeCookieFile();
     const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-    const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -F "${url}"`;
+    // Use JSON output – much easier to parse and returns ALL formats
+    const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -J "${url}"`;
 
     const stdout = await new Promise((resolve, reject) => {
-      exec(cmd, { timeout: 10000 }, (error, stdout, stderr) => {
+      exec(cmd, { timeout: 15000 }, (error, stdout, stderr) => {
         try { fs.unlinkSync(cookieFile); } catch (_) {}
         if (error) return reject(new Error(stderr || error.message));
         resolve(stdout);
       });
     });
 
-    const lines = stdout.split('\n');
-    const formats = [];
-    for (const line of lines) {
-      // Look for a resolution pattern like "640x360" or "1920x1080"
-      const resolutionMatch = line.match(/(\d{3,4})x(\d{3,4})/);
-      if (resolutionMatch) {
-        const width = parseInt(resolutionMatch[1]);
-        const height = parseInt(resolutionMatch[2]);
+    const videoInfo = JSON.parse(stdout);
+    const formats = videoInfo.formats || [];
 
-        // Skip duplicate heights
-        if (formats.find(f => f.height === height)) continue;
+    const seen = new Set();
+    const qualities = [];
 
-        // Try to find a file size – a number followed by 'k' or 'M' after the resolution
-        let size = 0;
-        const sizeMatch = line.match(/(\d+(?:\.\d+)?)(k|M)\b/);
-        if (sizeMatch) {
-          const val = parseFloat(sizeMatch[1]);
-          size = sizeMatch[2] === 'M' ? val * 1024 * 1024 : val * 1024;
-        } else {
-          // Fallback estimate: assume ~1 MB per minute of video is too vague, so use height as a rough indicator
-          size = height * 2000;   // very rough, but enough for the UI
-        }
+    for (const f of formats) {
+      // Only consider formats that have a video stream (height > 0)
+      if (!f.height || f.height === 0) continue;
+      const height = f.height;
+      if (seen.has(height)) continue;
+      seen.add(height);
 
-        formats.push({
-          height,
-          label: `${height}p`,
-          size: Math.round(size),
-        });
+      // Try to get a file size (approximate if missing)
+      let size = f.filesize || f.filesize_approx || 0;
+      if (!size && f.tbr) {
+        // tbr = total bitrate in kbps; assume 1 minute video for rough estimate
+        size = (f.tbr * 1000 / 8) * 60; // rough bytes for 1 minute
       }
+      // Fallback size based on height
+      if (!size) size = height * 2000;
+
+      qualities.push({
+        height,
+        label: `${height}p`,
+        size: Math.round(size),
+      });
     }
 
-    // Sort highest quality first
-    formats.sort((a, b) => b.height - a.height);
-    cache.set(cacheKey, formats);
-    res.json(formats);
+    // Sort from highest to lowest
+    qualities.sort((a, b) => b.height - a.height);
+    cache.set(cacheKey, qualities);
+    res.json(qualities);
   } catch (e) {
     console.error('Formats extraction failed:', e.message);
     res.status(500).json({ error: e.message });
