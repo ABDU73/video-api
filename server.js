@@ -48,22 +48,24 @@ function getYouTubeId(url) {
   return match ? match[1] : null;
 }
 
+function getCookieContent() {
+  const raw = process.env.YOUTUBE_COOKIES || '';
+  if (!raw) return null;
+  if (raw.startsWith('# Netscape')) return raw;
+  return Buffer.from(raw, 'base64').toString('utf8');
+}
+
+function writeCookieFile() {
+  const content = getCookieContent();
+  if (!content) throw new Error('YOUTUBE_COOKIES not set');
+  const cookieFile = '/tmp/yt-cookies.txt';
+  fs.writeFileSync(cookieFile, content);
+  return cookieFile;
+}
+
 // ====================== EXTRACTION ======================
 async function extractYtDlp(url, format = '18') {
-  const cookieFile = '/tmp/yt-cookies.txt';
-  const cookiesRaw = process.env.YOUTUBE_COOKIES || '';
-
-  if (!cookiesRaw) throw new Error('YOUTUBE_COOKIES not set');
-
-  let cookies;
-  if (cookiesRaw.startsWith('# Netscape')) {
-    cookies = cookiesRaw;
-  } else {
-    cookies = Buffer.from(cookiesRaw, 'base64').toString('utf8');
-  }
-
-  fs.writeFileSync(cookieFile, cookies);
-
+  const cookieFile = writeCookieFile();
   const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
   const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -f ${format} --no-playlist --socket-timeout 10 -g "${url}"`;
 
@@ -85,12 +87,10 @@ async function getStreamUrl(youtubeUrl, quality = 'download', targetHeight = nul
 
   let format;
   if (quality === 'play') {
-    format = 'best[height<=720]';                     // streaming
+    format = 'best[height<=720]';
   } else if (targetHeight) {
-    // /get?q=360  →  best[height<=360][ext=mp4]
     format = `best[height<=${targetHeight}][ext=mp4]`;
   } else {
-    // default download = 480p
     format = 'best[height<=480][ext=mp4]';
   }
 
@@ -142,9 +142,104 @@ app.get('/play', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────
+// NEW: Formats endpoint – returns all available video qualities
+// ──────────────────────────────────────────────
+app.get('/formats', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  const cacheKey = `formats:${url}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const cookieFile = writeCookieFile();
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+    const cmd = `yt-dlp --user-agent "${userAgent}" --cookies "${cookieFile}" -F "${url}"`;
+
+    const stdout = await new Promise((resolve, reject) => {
+      exec(cmd, { timeout: 10000 }, (error, stdout, stderr) => {
+        try { fs.unlinkSync(cookieFile); } catch (_) {}
+        if (error) return reject(new Error(stderr || error.message));
+        resolve(stdout);
+      });
+    });
+
+    // Parse the output to extract heights and sizes
+    const lines = stdout.split('\n');
+    const formats = [];
+    for (const line of lines) {
+      // Example line: "18          mp4        640x360    360p  365k , ..."
+      const match = line.match(/(\d+)x(\d+).*?\s+(\d+)k/);
+      if (match) {
+        const width = parseInt(match[1]);
+        const height = parseInt(match[2]);
+        const bitrate = parseInt(match[3]);
+        if (!formats.find(f => f.height === height)) {
+          formats.push({
+            height,
+            label: `${height}p`,
+            size: bitrate * 1024, // rough estimate in bytes
+          });
+        }
+      }
+    }
+
+    formats.sort((a, b) => b.height - a.height);
+    cache.set(cacheKey, formats);
+    res.json(formats);
+  } catch (e) {
+    console.error('Formats extraction failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Optional search (requires YOUTUBE_API_KEY)
 app.get('/search', async (req, res) => {
-  // ... (unchanged, can be removed if not used)
+  const { q, pageToken } = req.query;
+  if (!q) return res.status(400).json({ error: 'q required' });
+  if (!process.env.YOUTUBE_API_KEY) return res.status(500).json({ error: 'API key missing' });
+
+  try {
+    const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+      params: {
+        part: 'snippet',
+        maxResults: 20,
+        q,
+        type: 'video',
+        key: process.env.YOUTUBE_API_KEY,
+        pageToken,
+      },
+    });
+
+    const items = resp.data.items;
+    let durations = {};
+    if (items.length) {
+      try {
+        const durResp = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+          params: {
+            part: 'contentDetails',
+            id: items.map(i => i.id.videoId).join(','),
+            key: process.env.YOUTUBE_API_KEY,
+          },
+        });
+        durResp.data.items.forEach(i => durations[i.id] = i.contentDetails.duration);
+      } catch (e) {}
+    }
+
+    const videos = items.map(i => ({
+      videoId: i.id.videoId,
+      title: i.snippet.title,
+      author: i.snippet.channelTitle,
+      thumbnail: i.snippet.thumbnails.high?.url || i.snippet.thumbnails.medium?.url || i.snippet.thumbnails.default?.url,
+      duration: durations[i.id.videoId] || 'Unknown',
+    }));
+
+    res.json({ videos, nextPageToken: resp.data.nextPageToken });
+  } catch (e) {
+    res.status(500).json({ error: 'Search failed' });
+  }
 });
 
 app.listen(port, () => console.log(`Vortex proxy running on port ${port}`));
