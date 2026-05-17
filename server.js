@@ -143,7 +143,7 @@ app.get('/play', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
-// NEW: Formats endpoint – returns all available video qualities
+// FORMATS endpoint – returns all available video qualities
 // ──────────────────────────────────────────────
 app.get('/formats', async (req, res) => {
   const url = req.query.url;
@@ -166,26 +166,38 @@ app.get('/formats', async (req, res) => {
       });
     });
 
-    // Parse the output to extract heights and sizes
     const lines = stdout.split('\n');
     const formats = [];
     for (const line of lines) {
-      // Example line: "18          mp4        640x360    360p  365k , ..."
-      const match = line.match(/(\d+)x(\d+).*?\s+(\d+)k/);
-      if (match) {
-        const width = parseInt(match[1]);
-        const height = parseInt(match[2]);
-        const bitrate = parseInt(match[3]);
-        if (!formats.find(f => f.height === height)) {
-          formats.push({
-            height,
-            label: `${height}p`,
-            size: bitrate * 1024, // rough estimate in bytes
-          });
+      // Look for a resolution pattern like "640x360" or "1920x1080"
+      const resolutionMatch = line.match(/(\d{3,4})x(\d{3,4})/);
+      if (resolutionMatch) {
+        const width = parseInt(resolutionMatch[1]);
+        const height = parseInt(resolutionMatch[2]);
+
+        // Skip duplicate heights
+        if (formats.find(f => f.height === height)) continue;
+
+        // Try to find a file size – a number followed by 'k' or 'M' after the resolution
+        let size = 0;
+        const sizeMatch = line.match(/(\d+(?:\.\d+)?)(k|M)\b/);
+        if (sizeMatch) {
+          const val = parseFloat(sizeMatch[1]);
+          size = sizeMatch[2] === 'M' ? val * 1024 * 1024 : val * 1024;
+        } else {
+          // Fallback estimate: assume ~1 MB per minute of video is too vague, so use height as a rough indicator
+          size = height * 2000;   // very rough, but enough for the UI
         }
+
+        formats.push({
+          height,
+          label: `${height}p`,
+          size: Math.round(size),
+        });
       }
     }
 
+    // Sort highest quality first
     formats.sort((a, b) => b.height - a.height);
     cache.set(cacheKey, formats);
     res.json(formats);
